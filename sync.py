@@ -283,11 +283,12 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
                 status='active',
             )
 
-
-        if nb_ip_record := list(nb_api.ipam.ip_addresses.filter(address=curr_ip.address)):
-            # We only want to update if its on the same device.
-            if nb_ip_record[0].assigned_object_type == 'dcim.interface' \
-                and nb_ip_record[0].assigned_object_id in nb_interface_id_list:
+        nb_ip_record = list(nb_api.ipam.ip_addresses.filter(address=curr_ip.address))
+        if nb_ip_record:
+            # We only want to update if its on the same device or not assigned to anything.
+            if nb_ip_record[0].assigned_object_type is None or \
+                (nb_ip_record[0].assigned_object_type == 'dcim.interface' \
+                and nb_ip_record[0].assigned_object_id in nb_interface_id_list):
                 update_ip_address(curr_ip, nb_ip_record, nb_interface_dict)
             else:
                 create_ip_address(nb_api, curr_ip, nb_interface_dict)
@@ -372,9 +373,10 @@ def main() -> None:
 
         # Filter the device roles we don't want to probe.
         if device_nb.role.slug in utils.device_roles_to_ignore:
+            logger.debug(f"Skipping device due to role: {device_nb.name}")
             continue
 
-        logger.info(
+        logger.debug(
             f"Processing device: {device_nb.id:04}/{device_nb.name}/{device_nb.role.slug}"
             f" => {device_nb.platform} => {device_nb.primary_ip}"
         )
