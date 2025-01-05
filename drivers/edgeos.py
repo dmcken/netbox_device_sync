@@ -378,7 +378,9 @@ class EdgeOS(drivers.base.DriverBase):
                 interface_record.type = None
 
             try:
-                interface_record.mac_address = curr_int['MAC']
+                # For specific values of MAC leave it as None
+                if curr_int['MAC'].strip() not in ['']:
+                    interface_record.mac_address = curr_int['MAC'].strip()
             except KeyError:
                 # The MAC is not set on EdgeOS devices loopback
                 if curr_int['FullInterfaceName'] not in ['lo','tun0',]:
