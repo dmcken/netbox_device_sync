@@ -67,6 +67,7 @@ class Vlan:
     Vlan virtual interfaces (usually with IPs) are treated as interfaces.
     '''
     id: int
+    bridge: str = None
     name: str = None
     description: str = None
     status: str = None
@@ -78,7 +79,7 @@ class Neighbour:
     Can be lldp, CDP, ARP, NDP, etc.
     '''
     mac: str = None
-    address: ipaddress.IPv4Address | ipaddress.IPv6Address
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address = None
     name: str = None
     interface: str = None
     source: str = None
@@ -228,9 +229,23 @@ class DriverBase(metaclass = abc.ABCMeta):
         '''
 
     # @abc.abstractmethod
-    # def get_vlans(self,):
-    #     pass
+    def get_vlans(self,) -> list[Vlan]:
+        """Get vlans configured on a device.
+
+        Return a blank list if the driver doesn't implement.
+
+        Returns:
+            list[Vlan]: _description_
+        """
+        return []
 
     # @abc.abstractmethod
-    # def get_neighbours(self,):
-    #     pass
+    def get_neighbours(self,) -> list[Neighbour]:
+        """Get neighbours to a device.
+
+        Return a black list if the driver doesn't implement.
+
+        Returns:
+            list[Neighbour]: _description_
+        """
+        return []
