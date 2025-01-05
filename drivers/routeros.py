@@ -100,7 +100,9 @@ class RouterOS(drivers.base.DriverBase):
             )
 
             try:
-                interface_rec.mac_address = curr_interface['mac-address']
+                # For specific values of MAC leave it as None
+                if interface_rec.mac_address not in ['']:
+                    interface_rec.mac_address = curr_interface['mac-address']
             except KeyError:
                 interface_rec.mac_address = None
 
