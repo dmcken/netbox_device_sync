@@ -27,7 +27,15 @@ import utils
 
 logger = logging.getLogger(__name__)
 
-def interface_create(nb: pynetbox.api, device_nb, cleaned_params, curr_dev_interface):
+def interface_create(nb: pynetbox.api, device_nb, cleaned_params, curr_dev_interface) -> None:
+    """Create an interface on a device.
+
+    Args:
+        nb (pynetbox.api): _description_
+        device_nb (_type_): _description_
+        cleaned_params (_type_): _description_
+        curr_dev_interface (_type_): _description_
+    """
 
     if 'type' not in cleaned_params:
         # Type is mandatory
@@ -65,7 +73,15 @@ def interface_create(nb: pynetbox.api, device_nb, cleaned_params, curr_dev_inter
 
 def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_interface,
                      cleaned_params: dict[str,str]):
+    """Update a device interface.
 
+    Args:
+        nb (pynetbox.api): _description_
+        device_nb (_type_): _description_
+        nb_interface_dict (_type_): _description_
+        curr_dev_interface (_type_): _description_
+        cleaned_params (dict[str,str]): _description_
+    """
 
     curr_nb_obj = nb_interface_dict[curr_dev_interface.name]
     changed = {}
@@ -306,6 +322,21 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
 
     return
 
+def sync_neighbours(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
+    """Sync neighbour data.
+
+    Args:
+        nb_api (pynetbox.api): _description_
+        device_nb (_type_): _description_
+        device_conn (drivers.base.DriverBase): _description_
+    """
+
+    dev_neighbours = device_conn.get_neighbours()
+
+    for curr_neighbour in dev_neighbours:
+        logger.debug(f"Syncronizing neighbour: {curr_neighbour}")
+
+
 def setup_logging(args: argparse.Namespace) -> None:
     """Setup logging.
 
@@ -316,13 +347,15 @@ def setup_logging(args: argparse.Namespace) -> None:
     logging.getLogger('ncclient').setLevel(logging.ERROR)
     logging.getLogger('paramiko.transport').setLevel(logging.ERROR)
     logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
-    # Internal modules
-    logging.getLogger('__main__').setLevel(logging.INFO)
     logging.getLogger('drivers.edgeos').setLevel(logging.ERROR)
     if args.debug is True:
         log_level = logging.DEBUG
     else:
         log_level = logging.INFO
+
+    # Internal modules
+    logging.getLogger('__main__').setLevel(log_level)
+
 
     logging.basicConfig(
         level = log_level,
@@ -337,7 +370,17 @@ def parse_arguments() -> argparse.Namespace:
         description="",
     )
 
-    parser.add_argument('-d','--debug', action='store_true')
+    parser.add_argument(
+        '-d',
+        '--debug',
+        action='store_true',
+        help="Activate debug mode with allot more output, mostly useful for troubleshooting issues."
+    )
+
+    parser.add_argument(
+        '-n' ,'--netbox-device', nargs='+', default=[],
+        help="Only process netbox devices specified, can be specified multiple times."
+    )
 
     args = parser.parse_args()
     return args
@@ -347,6 +390,7 @@ def main() -> None:
     '''
     args = parse_arguments()
     setup_logging(args)
+    logger.debug(f"CLI arguments: {pprint.pformat(args)}")
 
     nb_api = pynetbox.api(
         config.NB_URL,
@@ -390,11 +434,13 @@ def main() -> None:
             continue
 
         # Filter devices with specific names
-        # This should be provided via CLI arguments.
-        # if device_nb.name not in []:
-        #     continue
+        if args.netbox_device is not []:
+            if device_nb.name not in args.netbox_device:
+                # logger.info(f"Skipping device due to device name: '{device_nb.name}'")
+                continue
 
         try:
+            logger.info(f"Processing: {device_nb.name}")
             # Build the driver and connect to the device
             # Create a driver passing it the credentials and the primary IP
             try:
@@ -411,6 +457,7 @@ def main() -> None:
             # Now to sync the data
             sync_interfaces(nb_api, device_nb, device_conn)
             sync_ips(nb_api, device_nb, device_conn)
+            sync_neighbours(nb_api, device_nb, device_conn)
 
             # To Sync
             # - Vlans - Only for devices in charge of the vlan domain
@@ -420,7 +467,6 @@ def main() -> None:
 
             # sync_vlans()
             # sync_routes(nb, device_nb, device_conn)
-            # sync_neighbours(nb, device_nb, device_conn)
             del device_conn
         except drivers.base.ConnectError as exc:
             logger.error(
