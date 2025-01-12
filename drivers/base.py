@@ -79,7 +79,7 @@ class Neighbour:
     Can be lldp, CDP, ARP, NDP, etc.
     '''
     mac: str = None
-    address: ipaddress.IPv4Address | ipaddress.IPv6Address = None
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address = None
     name: str = None
     interface: str = None
     source: str = None
