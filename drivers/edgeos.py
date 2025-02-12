@@ -238,12 +238,12 @@ class EdgeOS(drivers.base.DriverBase):
                 continue
 
             # These are the lines that require no special state
-            res = re.match(r'\s+Description: (.*)', curr_line)
+            res = re.match(r'\\s+Description: (.*)', curr_line)
             if res:
                 curr_interface['Description'] = res.group(1)
                 continue
 
-            res = re.match(f'\s+link/ether {re_mac} brd {re_mac}', curr_line)
+            res = re.match(f'\\s+link/ether {re_mac} brd {re_mac}', curr_line)
             if res:
                 curr_interface['MAC'] = res.group(1)
                 curr_interface['Broadcast'] = res.group(2)
@@ -279,7 +279,7 @@ class EdgeOS(drivers.base.DriverBase):
 
             # These lines set state
             res = re.match(
-                f'\s+{re_address_family} {rep_ip_with_mask}( brd {re_ip}|) scope {re_address_scope}( {re_interface_name}|)',
+                f'\\s+{re_address_family} {rep_ip_with_mask}( brd {re_ip}|) scope {re_address_scope}( {re_interface_name}|)',
                 curr_line
             )
             if res:
