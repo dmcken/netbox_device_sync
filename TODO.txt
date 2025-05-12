@@ -1,4 +1,4 @@
 
 
 # Automatic registration of new drivers.
-# Document requirements for drivers.
+# Document requirements for drivers (majority is in the base class)
