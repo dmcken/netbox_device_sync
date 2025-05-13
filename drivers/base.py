@@ -243,7 +243,7 @@ class DriverBase(metaclass = abc.ABCMeta):
     def get_neighbours(self,) -> list[Neighbour]:
         """Get neighbours to a device.
 
-        Return a black list if the driver doesn't implement.
+        Return a blank list if the driver doesn't implement this function.
 
         Returns:
             list[Neighbour]: _description_
