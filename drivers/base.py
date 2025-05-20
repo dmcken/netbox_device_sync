@@ -40,7 +40,7 @@ class Interface:
     bridge: str | None = None
     description: str = None
     lag: str | None = None
-    mac_address: str = None
+    mac_address: list[str] = None
     mtu: int | None = None
     parent: str | None = None
     type: str = None
@@ -77,8 +77,11 @@ class Neighbour:
     '''Neighbour to current device.
 
     Can be lldp, CDP, ARP, NDP, etc.
+
+    extra_data:
+    - static: Mark an entry as a static ARP or DHCP entry.
     '''
-    mac: str = None
+    mac: list[str] = None
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address = None
     name: str = None
     interface: str = None

@@ -59,17 +59,23 @@ def interface_create(nb: pynetbox.api, device_nb, cleaned_params, curr_dev_inter
                 )
                 cleaned_params[master_interface] = None
 
+    if 'mac_addresses' in cleaned_params:
+        cleaned_params['mac_addresses'] = map(lambda x: x.id, cleaned_params['mac_addresses'])
+
     logger.info(
         f"Creating '{curr_dev_interface.name}' on "
         f"'{device_nb.name}' => {cleaned_params}"
     )
     try:
-        nb.dcim.interfaces.create(device=device_nb.id, **cleaned_params)
+        curr_nb_obj = nb.dcim.interfaces.create(device=device_nb.id, **cleaned_params)
     except pynetbox.core.query.RequestError as exc:
         logger.error(
             f"Netbox API Error '{exc}' creating interface "
             f"{cleaned_params}/{device_nb.name}"
         )
+        return None
+
+    return curr_nb_obj
 
 def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_interface,
                      cleaned_params: dict[str,str]):
@@ -126,6 +132,19 @@ def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_in
                     'new': new_parent_desc,
                 }
                 setattr(curr_nb_obj, k, new_parent)
+        elif k in 'mac_addresses':
+            # v is going to be the list of MAC address objects
+            # getattr(curr_nb_obj, k) will be the list of nb MACs
+            nb_macs = set(getattr(curr_nb_obj, k))
+            to_add = set(v).difference(nb_macs)
+            to_del = nb_macs.difference(set(v))
+            final_list = list(nb_macs) + list(to_add)
+            if to_add:
+                changed[k] = {
+                    'old': getattr(curr_nb_obj, k),
+                    'new': final_list
+                }
+                curr_nb_obj.mac_addresses.append(to_add)
         elif getattr(curr_nb_obj,k) != v:
             changed[k] = {
                 'old': getattr(curr_nb_obj,k),
@@ -139,6 +158,97 @@ def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_in
             f"=> {pprint.pformat(changed)}"
         )
         curr_nb_obj.save()
+
+def fetch_nb_mac(nb: pynetbox.api, mac_str: str) -> pynetbox.core.response.Record:
+    """Fetch a netbox MAC address, creating if neccesary.
+
+    Args:
+        nb (pynetbox.api): Existing pynetbox API object.
+        mac_str (str): MAC address in string format to fetch.
+
+    Returns:
+        pynetbox.core.response.Record: DCIM > MAC Address object.
+    """
+    if mac_str in ['00:00:00:00:00:00']:
+        return None
+
+    result = list(nb.dcim.mac_addresses.filter(mac_address=mac_str))
+    if result:
+        return result[0]
+
+    # It doesn't exist, create it
+    logger.info(f"Creating MAC: {mac_str}")
+    obj = nb.dcim.mac_addresses.create(
+        mac_address=mac_str
+    )
+
+    return obj
+
+def set_interface_macs(dev_interface, nb_interface, nb) -> None:
+    """Set MACs on the interfaces
+
+    Args:
+        curr_dev_interface (_type_): Driver interface object.
+        nb_interface (_type_): Netbox interface object.
+        nb (_type_): Netbox API object.
+    """
+    logger.debug(f"Entered set_interface_macs {dev_interface} => {nb_interface}")
+
+    # MAC addresses are now related items
+    mac_data = list(filter(
+        lambda x: x not in utils.macs_to_ignore,
+        getattr(dev_interface, 'mac_address', []),
+    ))
+
+    if not mac_data:
+        return
+
+    if dev_interface.type in ['bridge','lag','loopback','virtual']:
+        logger.debug(f"Skipping setting MAC on interface {dev_interface.name}")
+        return
+    nb_mac_objs = []
+    for curr_mac in mac_data:
+        nb_mac_objs.append(fetch_nb_mac(nb, curr_mac))
+
+    for curr_mac in nb_mac_objs:
+        if curr_mac is None:
+            continue
+        changes = {}
+        # Set mac.assigned_object_type to 'dcim.interface'
+        if curr_mac.assigned_object_type != 'dcim.interface':
+            changes['assigned_object_type'] = {
+                'old': curr_mac.assigned_object_type,
+                'new': 'dcim.interface',
+            }
+            curr_mac.assigned_object_type = 'dcim.interface'
+
+        # Set mac.assigned_object_id to nb_interface.id
+        if curr_mac.assigned_object_id != nb_interface.id:
+            changes['assigned_object_id'] = {
+                'old': curr_mac.assigned_object_id,
+                'new': nb_interface.id,
+            }
+            curr_mac.assigned_object_id = nb_interface.id
+
+        if changes:
+            try:
+                update_result = curr_mac.save()
+                logger.error(f"Updating MAC '{curr_mac}' => {changes} => {update_result}")
+            except pynetbox.core.query.RequestError as exc:
+                logger.error(f"Error: {exc} assigning {curr_mac} to {nb_interface}")
+                continue
+
+    # Now set the primary MAC on the interface.
+    try:
+        if nb_interface.primary_mac_address != nb_mac_objs[0].id:
+            nb_interface.primary_mac_address = nb_mac_objs[0].id
+            nb_interface.save()
+    except pynetbox.core.query.RequestError as exc:
+        logger.error(f"Error: {exc} assigning primary {nb_mac_objs[0]} to "
+                        f"{nb_interface} of type {nb_interface.type.value}")
+    except AttributeError:
+        # nb_mac_objs can be an empty list
+        pass
 
 
 def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
@@ -170,6 +280,10 @@ def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.Drive
     for curr_dev_interface in dev_interfaces:
         cleaned_params = {}
         for curr_param, param_data in utils.interface_fields_to_sync.items():
+            # Skip for now
+            if curr_param == 'mac_address':
+                continue
+
             cleaned_params[curr_param] = getattr(curr_dev_interface, curr_param)
             if cleaned_params[curr_param] is None:
                 del cleaned_params[curr_param]
@@ -188,12 +302,17 @@ def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.Drive
                 cleaned_params,
             )
         else:
-            interface_create(
+            nb_interface_obj = interface_create(
                 nb,
                 device_nb,
                 cleaned_params,
                 curr_dev_interface,
             )
+            if nb_interface_obj:
+                nb_interface_dict[curr_dev_interface.name] = nb_interface_obj
+
+
+        set_interface_macs(curr_dev_interface, nb_interface_dict[curr_dev_interface.name], nb)
 
     # Delete extra interfaces in netbox that are no longer on the device.
     nb_interfaces_to_delete = filter(lambda x: x.name in to_delete_from_nb, nb_interfaces)
@@ -285,31 +404,34 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
     nb_interface_id_list = list(map(lambda x: x.id, nb_interfaces))
 
     for curr_ip in dev_ips:
-        logger.debug(f"Processing IP address: {curr_ip}")
-        if curr_ip.interface not in nb_interface_dict:
-            logger.error(f"Missing interface for IP: {curr_ip}")
-            continue
+        try:
+            logger.debug(f"Processing IP address: {curr_ip}")
+            if curr_ip.interface not in nb_interface_dict:
+                logger.error(f"Missing interface for IP: {curr_ip}")
+                continue
 
-        nb_ip_network = nb_api.ipam.prefixes.filter(prefix=str(curr_ip.address.network))
-        if not nb_ip_network:
-            logger.error(f"Creating prefix: {curr_ip.address.network}")
-            nb_api.ipam.prefixes.create(
-                prefix=f"{curr_ip.address.network}",
-                vrf=curr_ip.vrf,
-                status='active',
-            )
+            nb_ip_network = nb_api.ipam.prefixes.filter(prefix=str(curr_ip.address.network))
+            if not nb_ip_network:
+                logger.error(f"Creating prefix: {curr_ip.address.network}")
+                nb_api.ipam.prefixes.create(
+                    prefix=f"{curr_ip.address.network}",
+                    vrf=curr_ip.vrf,
+                    status='active',
+                )
 
-        nb_ip_record = list(nb_api.ipam.ip_addresses.filter(address=curr_ip.address))
-        if nb_ip_record:
-            # We only want to update if its on the same device or not assigned to anything.
-            if nb_ip_record[0].assigned_object_type is None or \
-                (nb_ip_record[0].assigned_object_type == 'dcim.interface' \
-                and nb_ip_record[0].assigned_object_id in nb_interface_id_list):
-                update_ip_address(curr_ip, nb_ip_record, nb_interface_dict)
+            nb_ip_record = list(nb_api.ipam.ip_addresses.filter(address=curr_ip.address))
+            if nb_ip_record:
+                # We only want to update if its on the same device or not assigned to anything.
+                if nb_ip_record[0].assigned_object_type is None or \
+                    (nb_ip_record[0].assigned_object_type == 'dcim.interface' \
+                    and nb_ip_record[0].assigned_object_id in nb_interface_id_list):
+                    update_ip_address(curr_ip, nb_ip_record, nb_interface_dict)
+                else:
+                    create_ip_address(nb_api, curr_ip, nb_interface_dict)
             else:
                 create_ip_address(nb_api, curr_ip, nb_interface_dict)
-        else:
-            create_ip_address(nb_api, curr_ip, nb_interface_dict)
+        except pynetbox.core.query.RequestError as exc:
+            logger.error(f"Error processing {curr_ip} => {exc}")
 
     # Now we need to check for those that need to be removed from netbox
     to_del = set(nb_ipaddresses_dict.keys()).difference(set(map(lambda x: x.address, dev_ips)))
@@ -335,7 +457,40 @@ def sync_neighbours(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.D
 
     for curr_neighbour in dev_neighbours:
         logger.debug(f"Syncronizing neighbour: {curr_neighbour}")
+        # MAC is now a list
+        nb_mac_objs = []
+        for curr_mac in curr_neighbour.mac:
+            nb_mac_objs.append(fetch_nb_mac(nb_api, curr_mac))
 
+        # Fetch the IP record if it exists.
+        ip_obj = list(nb_api.ipam.ip_addresses.filter(address=curr_neighbour.ip))
+
+        if ip_obj:
+            if ip_obj[0]['assigned_object_type'] == 'dcim.interface':
+                # If it already exists and is assigned to a device, leave alone.
+                continue
+            else:
+                # If not assigned to a device update any appropriate fields.
+                logger.debug(f"Updating: {ip_obj}")
+                continue
+
+        # Create a new IP address record with the info we have.
+        # Neighbour(
+        #   mac='C0:8A:CD:D5:05:78',
+        #   ip='10.32.232.3',
+        #   name=None,
+        #   interface='bond_v0060_CALIX_IPTV',
+        #   source='ARP',
+        #   extra_data=None
+        # )
+        logger.debug(f"Creating IP for {pprint.pformat(curr_neighbour)}")
+        nb_api.ipam.ip_addresses.create(
+            address=f"{curr_neighbour.ip}",
+            description=f"{curr_neighbour.source}#{device_nb}#{curr_neighbour.interface}#{curr_neighbour.name}",
+            # custom_fields={
+            #     'discovered_mac': nb_mac_obj.id,
+            # },
+        )
 
 def setup_logging(args: argparse.Namespace) -> None:
     """Setup logging.
@@ -344,10 +499,12 @@ def setup_logging(args: argparse.Namespace) -> None:
         args (argparse.Namespace): CLI arguments passed to app.
     """
     # Upstream libraries
+    logging.getLogger('librouteros').setLevel(logging.ERROR)
     logging.getLogger('ncclient').setLevel(logging.ERROR)
     logging.getLogger('paramiko.transport').setLevel(logging.ERROR)
     logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
     logging.getLogger('drivers.edgeos').setLevel(logging.ERROR)
+
     if args.debug is True:
         log_level = logging.DEBUG
     else:
@@ -417,7 +574,7 @@ def main() -> None:
 
         # Filter the device roles we don't want to probe.
         if device_nb.role.slug in utils.device_roles_to_ignore:
-            logger.debug(f"Skipping device due to role: {device_nb.name}")
+            logger.debug(f"Skipping device due to role: {device_nb.id}#{device_nb.name}")
             continue
 
         logger.debug(
@@ -457,7 +614,7 @@ def main() -> None:
             # Now to sync the data
             sync_interfaces(nb_api, device_nb, device_conn)
             sync_ips(nb_api, device_nb, device_conn)
-            sync_neighbours(nb_api, device_nb, device_conn)
+            # sync_neighbours(nb_api, device_nb, device_conn)
 
             # To Sync
             # - Vlans - Only for devices in charge of the vlan domain

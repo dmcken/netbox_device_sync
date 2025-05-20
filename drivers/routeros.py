@@ -96,15 +96,18 @@ class RouterOS(drivers.base.DriverBase):
             logger.debug(f"Interface data: {pprint.pformat(curr_interface)}")
 
             interface_rec = drivers.base.Interface(
-                name=curr_interface['name']
+                name=curr_interface['name'],
+                mac_address=[],
             )
 
             try:
-                # For specific values of MAC leave it as None
-                if interface_rec.mac_address not in ['']:
-                    interface_rec.mac_address = curr_interface['mac-address']
+                # For specific values of MAC ignore them
+                if interface_rec.mac_address not in ['','00:00:00:00:00:00']:
+                    interface_rec.mac_address.append(
+                        curr_interface['mac-address']
+                    )
             except KeyError:
-                interface_rec.mac_address = None
+                pass
 
             try:
                 interface_rec.mtu = int(curr_interface['mtu'])
@@ -197,3 +200,65 @@ class RouterOS(drivers.base.DriverBase):
                 rez_ip_addresses.append(ip_rec)
 
         return rez_ip_addresses
+
+    def get_neighbours(self,) -> list[drivers.base.Neighbour]:
+        """Get neighbours to a device.
+
+        Returns:
+            list[Neighbour]: List of neighbours to this device.
+        """
+        res_neighbours = []
+
+
+        to_check = {
+            'ARP':   {
+                'path': self._dev.path('ip','arp'),
+                'map': {
+                    'mac': 'mac-address',
+                    'ip': 'address',
+                    'interface': 'interface',
+                },
+                'filter': lambda x: x['complete'] == True,
+            },
+            # 'DHCP4': {
+            #     'path': self._dev.path('ip','dhcp-server','lease'),
+            #     'dhcp-server-path': self._dev.path('ip','dhcp-server'),
+            #     'map': {
+            #         'mac': 'mac-address',
+            #         'ip': 'address',
+            #         'interface': 'interface',
+            #     }
+            # },
+            # 'LLDP':  {
+            #     'path': self._dev.path('ip','neighbor'),
+            #     'map': {
+            #         'mac': 'mac-address',
+            #         'ip': 'address',
+            #         'interface': 'interface',
+            #         'name': 'identity',
+            #     },
+            # },
+            #'NDP':   {'path': self._dev.path('ipv6','neighbour') },
+            #'DHCP6': {'path': self._dev.path('ipv6','dhcp-server','binding') },
+        }
+        for source, data in to_check.items():
+            entries = list(data['path'])
+            if 'filter' in data:
+                entries = filter(data['filter'], entries)
+
+            # if 'dhcp-server-path' in data:
+
+
+            for curr_entry in entries:
+                entry_data = {'source': source}
+                for dst,src in data['map'].items():
+                    if dst == 'mac':
+                        # MACs is now a list
+                        entry_data[dst] = [curr_entry[src]]
+                    else:
+                        entry_data[dst] = curr_entry[src]
+
+                neighbour_rec = drivers.base.Neighbour(**entry_data)
+                res_neighbours.append(neighbour_rec)
+
+        return res_neighbours
