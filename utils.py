@@ -75,9 +75,14 @@ interface_fields_to_sync = {
     'bridge': {},
     'description': {},
     'lag': {},
-    'mac_address': {'clean': clean_mac},
+    'mac_address': {},
     'mtu': {},
     'name': {},
     'parent': {},
     'type': {},
 }
+
+macs_to_ignore = [
+    None,
+    '00:00:00:00:00:00',
+]
