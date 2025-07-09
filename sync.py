@@ -591,7 +591,7 @@ def main() -> None:
             continue
 
         # Filter devices with specific names
-        if args.netbox_device is not []:
+        if args.netbox_device:
             if device_nb.name not in args.netbox_device:
                 # logger.info(f"Skipping device due to device name: '{device_nb.name}'")
                 continue
