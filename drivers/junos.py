@@ -145,9 +145,16 @@ class JunOS(drivers.base.DriverBase):
                 interface_dict.description = None
 
             try:
-                interface_dict.mac_address = curr_int['current-physical-address']
-                if isinstance(interface_dict['mac_address'], collections.OrderedDict):
-                    interface_dict.mac_address = interface_dict['mac_address']['#text']
+                if isinstance(curr_int['current-physical-address'], dict):
+                    # Extract the mac from the dict object that likely looks like:
+                    # {'#text': '54:e0:32:6b:e1:10','@format': 'MAC 54:e0:32:6b:e1:10'}
+                    interface_dict.mac_address = [curr_int['current-physical-address']['#text']]
+                elif isinstance(curr_int['current-physical-address'], str):
+                    # Sometimes it just the raw string.
+                    interface_dict.mac_address = [curr_int['current-physical-address']]
+                else:
+                    logger.error(f"Unknown MAC on interface: {pprint.pformat(curr_int)}")
+                    interface_dict.mac_address = None
             except KeyError:
                 interface_dict.mac_address = None
 
