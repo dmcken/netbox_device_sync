@@ -137,6 +137,7 @@ class JunOS(drivers.base.DriverBase):
             #logger.debug("Processing interface:\n{0}".format(pprint.pformat(curr_int, width=200)))
             interface_dict = drivers.base.Interface(
                 name=f"{curr_int['name']}",
+                mac_address=[],
             )
 
             try:
@@ -148,15 +149,14 @@ class JunOS(drivers.base.DriverBase):
                 if isinstance(curr_int['current-physical-address'], dict):
                     # Extract the mac from the dict object that likely looks like:
                     # {'#text': '54:e0:32:6b:e1:10','@format': 'MAC 54:e0:32:6b:e1:10'}
-                    interface_dict.mac_address = [curr_int['current-physical-address']['#text']]
+                    interface_dict.mac_address.append(curr_int['current-physical-address']['#text'])
                 elif isinstance(curr_int['current-physical-address'], str):
                     # Sometimes it just the raw string.
-                    interface_dict.mac_address = [curr_int['current-physical-address']]
+                    interface_dict.mac_address.append(curr_int['current-physical-address'])
                 else:
                     logger.error(f"Unknown MAC on interface: {pprint.pformat(curr_int)}")
-                    interface_dict.mac_address = []
             except KeyError:
-                interface_dict.mac_address = []
+                pass
 
             try:
                 interface_dict.mtu = int(curr_int['mtu'])
@@ -249,7 +249,7 @@ class JunOS(drivers.base.DriverBase):
                     interface_units.append(drivers.base.Interface(
                         name=f"{curr_logical_int['name']}",
                         mtu=unit_mtu,
-                        mac_address=None,
+                        mac_address=[],
                         type='virtual',
                         description=unit_descripion,
                         parent=f"{curr_int['name']}",
