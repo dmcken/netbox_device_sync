@@ -603,9 +603,8 @@ def main() -> None:
             try:
                 driver = platform_to_driver[str(device_nb.platform)]
             except KeyError as exc:
-                raise drivers.base.ConnectError(
-                    f"Unsupported platform '{device_nb.platform}'"
-                ) from exc
+                logger.error(f"Unsupported platform '{device_nb.platform}'")
+                continue
 
             device_ip = str(ipaddress.ip_interface(device_nb.primary_ip).ip)
             full_dev_creds = {**device_credentials, 'hostname': device_ip}
