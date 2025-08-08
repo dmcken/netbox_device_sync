@@ -154,9 +154,9 @@ class JunOS(drivers.base.DriverBase):
                     interface_dict.mac_address = [curr_int['current-physical-address']]
                 else:
                     logger.error(f"Unknown MAC on interface: {pprint.pformat(curr_int)}")
-                    interface_dict.mac_address = None
+                    interface_dict.mac_address = []
             except KeyError:
-                interface_dict.mac_address = None
+                interface_dict.mac_address = []
 
             try:
                 interface_dict.mtu = int(curr_int['mtu'])
