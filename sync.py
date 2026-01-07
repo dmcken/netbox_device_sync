@@ -602,7 +602,7 @@ def main() -> None:
             # Create a driver passing it the credentials and the primary IP
             try:
                 driver = platform_to_driver[str(device_nb.platform)]
-            except KeyError as exc:
+            except KeyError:
                 logger.error(f"Unsupported platform '{device_nb.platform}'")
                 continue
 
