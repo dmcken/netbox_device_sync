@@ -4,4 +4,12 @@ version = "0.1.0"
 description = "Netbox device sync"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "junos-eznc>=2.7.6",
+    "librouteros>=4.0.1",
+    "paramiko>=5.0.0",
+    "pynetbox>=7.7.0",
+    "python-dotenv>=1.2.2",
+    "vyattaconfparser>=0.5.5",
+    "xmltodict>=1.0.4",
+]
