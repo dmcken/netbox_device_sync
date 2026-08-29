@@ -366,6 +366,7 @@ class EdgeOS(drivers.base.DriverBase):
             interface_record = drivers.base.Interface(
                 name=curr_int['FullInterfaceName'],
                 mtu=curr_int['MTU'],
+                mac_address=[],
             )
 
             try:
@@ -378,14 +379,13 @@ class EdgeOS(drivers.base.DriverBase):
                 interface_record.type = None
 
             try:
-                # For specific values of MAC leave it as None
+                # For specific values of MAC leave it as an empty list
                 if curr_int['MAC'].strip() not in ['']:
-                    interface_record.mac_address = curr_int['MAC'].strip()
+                    interface_record.mac_address.append(curr_int['MAC'].strip())
             except KeyError:
                 # The MAC is not set on EdgeOS devices loopback
                 if curr_int['FullInterfaceName'] not in ['lo','tun0',]:
                     logger.error(f"MAC not set on interface: {curr_int['FullInterfaceName']}")
-                interface_record.mac_address = ''
 
             try:
                 interface_record.description = curr_int['Description']
@@ -425,7 +425,10 @@ class EdgeOS(drivers.base.DriverBase):
 
             for curr_address in curr_int['Addresses']:
 
-                if curr_address['Address'] in self._addresses_to_ignore:
+                if any(
+                    curr_address['Address'] in curr_network
+                    for curr_network in self._addresses_to_ignore
+                ):
                     continue
 
                 address_rec = drivers.base.IPAddress(

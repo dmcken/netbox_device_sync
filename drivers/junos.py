@@ -92,9 +92,12 @@ class JunOS(drivers.base.DriverBase):
             raise e from e
 
     def _close(self,):
-        if self._dev:
-            self._dev.close()
-        del self._dev
+        try:
+            if self._dev:
+                self._dev.close()
+            del self._dev
+        except AttributeError:
+            pass
 
 
     def _get_config(self, xml_filter=None):
@@ -129,7 +132,12 @@ class JunOS(drivers.base.DriverBase):
         active_interfaces = []
         rez = self._dev.rpc.get_interface_information()
         int_dict = xmltodict.parse(etree.tostring(rez))
-        for curr_int in int_dict['interface-information']['physical-interface']:
+        physical_interfaces = int_dict['interface-information']['physical-interface']
+        if not isinstance(physical_interfaces, list):
+            # xmltodict only wraps repeated elements in a list, so a device
+            # with a single physical interface would otherwise return a dict.
+            physical_interfaces = [physical_interfaces]
+        for curr_int in physical_interfaces:
             # Interfaces to ignore.
             if re.match(self._interfaces_to_ignore_regex, curr_int['name']):
                 continue
@@ -278,7 +286,12 @@ class JunOS(drivers.base.DriverBase):
 
         rez = self._dev.rpc.get_interface_information()
         int_dict = xmltodict.parse(etree.tostring(rez))
-        for curr_int in int_dict['interface-information']['physical-interface']:
+        physical_interfaces = int_dict['interface-information']['physical-interface']
+        if not isinstance(physical_interfaces, list):
+            # xmltodict only wraps repeated elements in a list, so a device
+            # with a single physical interface would otherwise return a dict.
+            physical_interfaces = [physical_interfaces]
+        for curr_int in physical_interfaces:
 
             # Skip the ignored interfaces
             if re.match(self._interfaces_to_ignore_regex, curr_int['name']):
