@@ -145,8 +145,8 @@ class DriverBase(metaclass = abc.ABCMeta):
     def _connect(self, **kwargs):
         '''Creates a connection to the device.
 
-        The incoming parameters will be from the config.py DEV_* with the DEV_
-        prefix removed and then lowercased (e.g. DEV_USERNAME becomes username).
+        The incoming parameters will be from the .env DEV_* variables with the
+        DEV_ prefix removed and then lowercased (e.g. DEV_USERNAME becomes username).
         The hostname parameter is also added to this set of parameters and is
         the current device's hostname / IP.
 

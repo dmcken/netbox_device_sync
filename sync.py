@@ -10,20 +10,25 @@ The main CLI sits here.
 import argparse
 import ipaddress
 import logging
+import os
 import pprint
 import sys
 import traceback
 
 # External imports
+import dotenv
 import pynetbox
 
 # Local imports
-import config
 import drivers.base
 import drivers.edgeos
 import drivers.junos
 import drivers.routeros
 import utils
+
+dotenv.load_dotenv()
+
+LOGGING_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
 logger = logging.getLogger(__name__)
 
@@ -525,7 +530,7 @@ def setup_logging(args: argparse.Namespace) -> None:
 
     logging.basicConfig(
         level = log_level,
-        format=config.LOGGING_FORMAT,
+        format=LOGGING_FORMAT,
     )
 
 def parse_arguments() -> argparse.Namespace:
@@ -559,8 +564,8 @@ def main() -> None:
     logger.debug(f"CLI arguments: {pprint.pformat(args)}")
 
     nb_api = pynetbox.api(
-        config.NB_URL,
-        token=config.NB_TOKEN,
+        os.environ.get('NB_URL'),
+        token=os.environ.get('NB_TOKEN'),
         threading = True
     )
 
@@ -573,7 +578,7 @@ def main() -> None:
         'Ubiquiti EdgeRouter':  drivers.edgeos.EdgeOS,
     }
 
-    device_credentials = utils.parse_device_parameters(config)
+    device_credentials = utils.parse_device_parameters()
 
     # Fetch and process the devices from netbox.
     devices = nb_api.dcim.devices.all()

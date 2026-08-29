@@ -131,6 +131,3 @@ dmypy.json
 # SSH key files
 *.pub
 *.pri
-
-# Config file
-config.py

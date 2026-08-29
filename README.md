@@ -19,10 +19,10 @@ python3 -m pip install -r requirements.txt
 
 ## Configure
 
-Copy config-example.py to config.py
+Copy .env.example to .env and fill in your values.
 
 ```bash
-cp config-example.py config.py
+cp .env.example .env
 ```
 
 

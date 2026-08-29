@@ -5,6 +5,7 @@ General Utility definitions and functions
 
 # System imports
 import ipaddress
+import os
 import re
 
 # Common definitions
@@ -33,27 +34,25 @@ acceptable_device_status = [
 ]
 
 # Utility functions
-def parse_device_parameters(config):
-    """Parse the config parameters.
+def parse_device_parameters():
+    """Parse device connection parameters out of the environment (.env).
 
-    Args:
-        config (_type_): _description_
+    Any DEV_* environment variable is picked up, with the DEV_ prefix
+    stripped and the remainder lowercased as the resulting key.
 
     Returns:
-        _type_: _description_
+        dict[str,str]: Device connection parameters.
     """
     device_credentials = {}
-    for curr_dev_attr in dir(config):
-        attr_re = re.match("DEV_([A-Za-z0-9_]+)", curr_dev_attr)
+    for env_key, env_value in os.environ.items():
+        attr_re = re.match("DEV_([A-Za-z0-9_]+)", env_key)
         if not attr_re:
             continue
 
-        attr_value = getattr(config, curr_dev_attr)
-
-        if not attr_value:
+        if not env_value:
             continue
 
-        device_credentials[attr_re.group(1).lower()] = attr_value
+        device_credentials[attr_re.group(1).lower()] = env_value
 
     return device_credentials
 
