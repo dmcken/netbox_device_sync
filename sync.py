@@ -145,6 +145,8 @@ def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_in
                     'new': final_list
                 }
                 curr_nb_obj.mac_addresses.append(to_add)
+            if to_del:
+                logger.info(f"MACs to delete: {to_del}")
         elif getattr(curr_nb_obj,k) != v:
             changed[k] = {
                 'old': getattr(curr_nb_obj,k),
@@ -233,7 +235,7 @@ def set_interface_macs(dev_interface, nb_interface, nb) -> None:
         if changes:
             try:
                 update_result = curr_mac.save()
-                logger.error(f"Updating MAC '{curr_mac}' => {changes} => {update_result}")
+                logger.info(f"Updating MAC '{curr_mac}' => {changes} => {update_result}")
             except pynetbox.core.query.RequestError as exc:
                 logger.error(f"Error: {exc} assigning {curr_mac} to {nb_interface}")
                 continue
@@ -389,8 +391,10 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
 
     # - IP Addresses - The matching interfaces should already exist (create the matching prefixes)
     dev_ips = device_conn.get_ipaddresses()
-    for curr_network in utils.networks_to_ignore:
-        dev_ips = list(filter(lambda x: x.address not in curr_network, dev_ips))
+    for curr_network_to_ignore in utils.networks_to_ignore:
+        dev_ips = list(filter(
+            lambda x: x.address not in curr_network_to_ignore, dev_ips
+        ))
     logger.debug(
         f"Raw IP data for '{device_nb.name}'\n" +
         f"{pprint.pformat(dev_ips, width=200)}"
