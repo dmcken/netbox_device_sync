@@ -174,6 +174,11 @@ def fetch_nb_mac(nb: pynetbox.api, mac_str: str) -> pynetbox.core.response.Recor
     if mac_str in ['00:00:00:00:00:00']:
         return None
 
+    # Netbox stores/normalizes mac addresses as upper-case, but drivers
+    # typically report them lower-case, so filtering/creating without
+    # normalizing first would never match an existing record.
+    mac_str = utils.clean_mac(mac_str)
+
     result = list(nb.dcim.mac_addresses.filter(mac_address=mac_str))
     if result:
         return result[0]
@@ -600,6 +605,10 @@ def main() -> None:
                 # logger.info(f"Skipping device due to device name: '{device_nb.name}'")
                 continue
 
+        # Set before anything that could raise, so the exception handlers below
+        # always have a sane value to report even if it fails before being
+        # refined into a plain address further down.
+        device_ip = str(device_nb.primary_ip)
         try:
             logger.info(f"Processing: {device_nb.name}")
             # Build the driver and connect to the device

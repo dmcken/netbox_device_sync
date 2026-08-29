@@ -114,7 +114,7 @@ class RouterOS(drivers.base.DriverBase):
             except ValueError:
                 try:
                     interface_rec.mtu = int(curr_interface['actual-mtu'])
-                except KeyError:
+                except (KeyError, ValueError):
                     interface_rec.mtu = None
             except KeyError:
                 logger.error(f"Missing MTU for interface: {curr_interface['name']}")
