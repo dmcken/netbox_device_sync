@@ -570,7 +570,7 @@ def main() -> None:
     platform_to_driver = {
         'JunOS':            drivers.junos.JunOS,
         'RouterOS':         drivers.routeros.RouterOS,
-        'Ubiquiti EdgeOS':  drivers.edgeos.EdgeOS,
+        'EdgeOS':           drivers.edgeos.EdgeOS,
     }
 
     device_credentials = utils.parse_device_parameters(config)
