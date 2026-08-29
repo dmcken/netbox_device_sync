@@ -20,10 +20,13 @@ import dotenv
 import pynetbox
 
 # Local imports
+import drivers.airfiber
+import drivers.airos
 import drivers.base
 import drivers.edgeos
 import drivers.junos
 import drivers.routeros
+import drivers.uisp
 import utils
 
 dotenv.load_dotenv()
@@ -576,6 +579,9 @@ def main() -> None:
         'JunOS':                drivers.junos.JunOS,
         'RouterOS':             drivers.routeros.RouterOS,
         'Ubiquiti EdgeRouter':  drivers.edgeos.EdgeOS,
+        'AirOS v8':             drivers.airos.AirOS,
+        'AirFiber':             drivers.airfiber.AirFiber,
+        'UISP':                 drivers.uisp.Uisp,
     }
 
     device_credentials = utils.parse_device_parameters()
