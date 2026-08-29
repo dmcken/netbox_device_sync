@@ -29,10 +29,15 @@ class EdgeOS(drivers.base.DriverBase):
     RouterOS device driver
     '''
     _connect_params = {
-        'hostname': {'dest': 'host'},
-        'username': {'dest': 'username'},
-        'password': {'dest': 'password'},
+        'hostname':     {'dest': 'host'},
+        'username':     {'dest': 'username'},
+        'password':     {'dest': 'password'},
         #'keyfile':  {'dest': 'ssh_private_key_file'},
+        # Some Ubiquiti devices only support a single admin account, so a
+        # dedicated automation account can't be created on them. When set,
+        # these are tried before falling back to username/password.
+        'ubnt_username': {'dest': 'ubnt_username'},
+        'ubnt_password': {'dest': 'ubnt_password'},
     }
 
     _interfaces_to_ignore = [
@@ -57,21 +62,45 @@ class EdgeOS(drivers.base.DriverBase):
     def _connect(self, **kwargs) -> None:
         '''
         '''
-        try:
-            logger.debug(f"Attempting to connect to Ubnt EdgeOS device: {kwargs}")
-            self._dev = paramiko.client.SSHClient()
-            self._dev.load_system_host_keys()
-            self._dev.set_missing_host_key_policy(paramiko.client.AutoAddPolicy)
-            self._dev.connect(
-                hostname=kwargs['host'],
-                username=kwargs['username'],
-                password=kwargs['password'],
-                timeout=30,
+        # Some Ubiquiti devices only support a single admin account, so try
+        # that override first (if configured) before falling back to the
+        # standard shared automation account.
+        credential_candidates = []
+        if kwargs.get('ubnt_username') and kwargs.get('ubnt_password'):
+            credential_candidates.append(
+                (kwargs['ubnt_username'], kwargs['ubnt_password'])
             )
-        except paramiko.ssh_exception.AuthenticationException as exc:
-            raise drivers.base.AuthenticationError from exc
-        except paramiko.ssh_exception.SSHException as exc:
-            raise drivers.base.ConnectError from exc
+        credential_candidates.append((kwargs['username'], kwargs['password']))
+
+        last_exc = None
+        for curr_username, curr_password in credential_candidates:
+            try:
+                logger.debug(
+                    f"Attempting to connect to Ubnt EdgeOS device "
+                    f"{kwargs['host']} as '{curr_username}'"
+                )
+                self._dev = paramiko.client.SSHClient()
+                self._dev.load_system_host_keys()
+                self._dev.set_missing_host_key_policy(paramiko.client.AutoAddPolicy)
+                self._dev.connect(
+                    hostname=kwargs['host'],
+                    username=curr_username,
+                    password=curr_password,
+                    timeout=30,
+                    # Only ever authenticate with the explicit credentials
+                    # above - never the automation host's own SSH keys/agent.
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+                return
+            except paramiko.ssh_exception.AuthenticationException as exc:
+                logger.debug(f"Login as '{curr_username}' failed, trying next credential")
+                last_exc = exc
+                continue
+            except paramiko.ssh_exception.SSHException as exc:
+                raise drivers.base.ConnectError from exc
+
+        raise drivers.base.AuthenticationError from last_exc
 
     def _close(self,):
         try:

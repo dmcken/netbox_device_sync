@@ -44,7 +44,7 @@ def parse_device_parameters(config):
     """
     device_credentials = {}
     for curr_dev_attr in dir(config):
-        attr_re = re.match("DEV_([A-Za-z0-9]+)", curr_dev_attr)
+        attr_re = re.match("DEV_([A-Za-z0-9_]+)", curr_dev_attr)
         if not attr_re:
             continue
 

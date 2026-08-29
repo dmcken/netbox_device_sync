@@ -568,9 +568,9 @@ def main() -> None:
     # Drivers for use to fetch the data from devices:
     # - EdgeRouter
     platform_to_driver = {
-        'JunOS':            drivers.junos.JunOS,
-        'RouterOS':         drivers.routeros.RouterOS,
-        'EdgeOS':           drivers.edgeos.EdgeOS,
+        'JunOS':                drivers.junos.JunOS,
+        'RouterOS':             drivers.routeros.RouterOS,
+        'Ubiquiti EdgeRouter':  drivers.edgeos.EdgeOS,
     }
 
     device_credentials = utils.parse_device_parameters(config)
