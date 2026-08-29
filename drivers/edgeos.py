@@ -68,7 +68,6 @@ class EdgeOS(drivers.base.DriverBase):
                 password=kwargs['password'],
                 timeout=30,
             )
-            self._dev.exec_command('terminal length 0')
         except paramiko.ssh_exception.AuthenticationException as exc:
             raise drivers.base.AuthenticationError from exc
         except paramiko.ssh_exception.SSHException as exc:
