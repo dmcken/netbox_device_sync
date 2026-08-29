@@ -122,7 +122,7 @@ def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_in
 
 
             if k_attr := getattr(curr_nb_obj, k):
-                old_parent_desc = f"{k_attr.id}/{nb_parent_interfaces[0].name}"
+                old_parent_desc = f"{k_attr.id}/{k_attr.name}"
             else:
                 old_parent_desc = "None"
 
@@ -132,7 +132,7 @@ def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_in
                     'new': new_parent_desc,
                 }
                 setattr(curr_nb_obj, k, new_parent)
-        elif k in 'mac_addresses':
+        elif k == 'mac_addresses':
             # v is going to be the list of MAC address objects
             # getattr(curr_nb_obj, k) will be the list of nb MACs
             nb_macs = set(getattr(curr_nb_obj, k))
@@ -144,7 +144,7 @@ def interface_update(nb: pynetbox.api, device_nb, nb_interface_dict, curr_dev_in
                     'old': getattr(curr_nb_obj, k),
                     'new': final_list
                 }
-                curr_nb_obj.mac_addresses.append(to_add)
+                curr_nb_obj.mac_addresses.extend(to_add)
             if to_del:
                 logger.info(f"MACs to delete: {to_del}")
         elif getattr(curr_nb_obj,k) != v:

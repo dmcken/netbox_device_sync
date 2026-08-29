@@ -102,7 +102,7 @@ class RouterOS(drivers.base.DriverBase):
 
             try:
                 # For specific values of MAC ignore them
-                if interface_rec.mac_address not in ['','00:00:00:00:00:00']:
+                if curr_interface['mac-address'] not in ['','00:00:00:00:00:00']:
                     interface_rec.mac_address.append(
                         curr_interface['mac-address']
                     )

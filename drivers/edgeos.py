@@ -238,7 +238,7 @@ class EdgeOS(drivers.base.DriverBase):
                 continue
 
             # These are the lines that require no special state
-            res = re.match(r'\\s+Description: (.*)', curr_line)
+            res = re.match(r'\s+Description: (.*)', curr_line)
             if res:
                 curr_interface['Description'] = res.group(1)
                 continue

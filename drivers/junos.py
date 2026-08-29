@@ -356,7 +356,7 @@ class JunOS(drivers.base.DriverBase):
 
         return ip_addresses
 
-    def get_routes():
+    def get_routes(self):
 
         routes = []
 
