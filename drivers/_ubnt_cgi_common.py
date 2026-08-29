@@ -213,3 +213,17 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
             ))
 
         return addresses
+
+    def get_gps(self) -> drivers.base.GPSCoordinate | None:
+        '''This device's own GPS location, for devices with built-in
+        GPS hardware (e.g. Rocket Prism, AirFiber) - confirmed live on
+        an AirOSv8 Rocket Prism 5AC Gen2 and an AirFiber 5X HD.'''
+        gps = self._dev.get_gps()
+        if gps is None:
+            return None
+
+        return drivers.base.GPSCoordinate(
+            latitude=gps.latitude,
+            longitude=gps.longitude,
+            altitude_m=gps.altitude_m,
+        )

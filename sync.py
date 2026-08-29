@@ -461,6 +461,37 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
 
     return
 
+def sync_site_gps(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
+    """Backfill a Site's GPS location from a device with built-in GPS.
+
+    Only fills in Sites with no coordinates set at all - never
+    overwrites an existing value, whether that's a manually-entered one
+    or one already backfilled from another device at the same site.
+
+    Args:
+        nb_api (pynetbox.api): Netbox API connection.
+        device_nb (_type_): The device from netbox's perspective.
+        device_conn (drivers.base.DriverBase): _description_
+    """
+    if device_nb.site is None:
+        return
+
+    gps = device_conn.get_gps()
+    if gps is None:
+        return
+
+    site = nb_api.dcim.sites.get(id=device_nb.site.id)
+    if site.latitude is not None or site.longitude is not None:
+        return
+
+    logger.info(
+        f"Setting GPS for site '{site.name}' from '{device_nb.name}': "
+        f"{gps.latitude}, {gps.longitude}"
+    )
+    site.latitude = gps.latitude
+    site.longitude = gps.longitude
+    site.save()
+
 def sync_neighbours(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
     """Sync neighbour data.
 
@@ -637,6 +668,7 @@ def main() -> None:
             # Now to sync the data
             sync_interfaces(nb_api, device_nb, device_conn)
             sync_ips(nb_api, device_nb, device_conn)
+            sync_site_gps(nb_api, device_nb, device_conn)
             # sync_neighbours(nb_api, device_nb, device_conn)
 
             # To Sync

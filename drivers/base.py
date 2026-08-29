@@ -88,6 +88,15 @@ class Neighbour:
     source: str = None
     extra_data: str = None
 
+@dataclasses.dataclass
+class GPSCoordinate:
+    '''GPS location as reported by a device with built-in GPS - used to
+    backfill a Site's own location from whichever device at that tower
+    has a fix, rather than relying on manual entry.'''
+    latitude: float
+    longitude: float
+    altitude_m: float = None
+
 # Factories
 class DriverFactory:
     """Base factory for all driver objects"""
@@ -252,3 +261,15 @@ class DriverBase(metaclass = abc.ABCMeta):
             list[Neighbour]: _description_
         """
         return []
+
+    def get_gps(self,) -> GPSCoordinate | None:
+        """Get this device's own GPS location, for devices with built-in
+        GPS hardware.
+
+        Return None if the driver doesn't implement this function, or
+        the device has no GPS fix.
+
+        Returns:
+            GPSCoordinate | None: This device's GPS location.
+        """
+        return None

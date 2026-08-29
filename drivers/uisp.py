@@ -189,3 +189,21 @@ class Uisp(drivers.base.DriverBase):
             ))
 
         return neighbours
+
+    def get_gps(self) -> drivers.base.GPSCoordinate | None:
+        '''This device's own GPS location, for devices with built-in
+        GPS hardware - confirmed live on a Wave Pro and an AirFiber 60
+        XR. Works on any product line (EdgePower included), but not
+        every device has GPS hardware, and not every one with GPS
+        hardware has a current fix (confirmed live: an EdgePower and a
+        Wave AP with no fix both correctly return None here rather than
+        a bogus 0,0).'''
+        gps = self._dev.get_gps()
+        if gps is None:
+            return None
+
+        return drivers.base.GPSCoordinate(
+            latitude=gps.latitude,
+            longitude=gps.longitude,
+            altitude_m=gps.altitude_m,
+        )

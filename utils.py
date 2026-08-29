@@ -28,6 +28,11 @@ networks_to_ignore = [
     ipaddress.ip_network('127.0.0.0/8'), # IPv4 Loopback
     ipaddress.ip_network('::1/128'),     # IPv6 Loopback
     ipaddress.ip_network('FE80::/10'),   # Link local
+    # Shared local-management convenience address seen identically
+    # configured on multiple independent AirFiber units' secondary
+    # bridge (br2) - not a real per-device address, so not something
+    # NetBox's global IP uniqueness should ever be asked to track.
+    ipaddress.ip_network('192.168.2.0/24'),
 ]
 acceptable_device_status = [
     'active',
