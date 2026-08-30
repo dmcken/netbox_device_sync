@@ -27,6 +27,7 @@ import drivers.base
 import drivers.edgeos
 import drivers.junos
 import drivers.routeros
+import drivers.tachyon
 import drivers.uisp
 import utils
 
@@ -1346,6 +1347,7 @@ def main() -> None:
         'AirOS v8':             drivers.airos.AirOS,
         'AirFiber':             drivers.airfiber.AirFiber,
         'UISP':                 drivers.uisp.Uisp,
+        'Tachyon':              drivers.tachyon.Tachyon,
     }
 
     device_credentials = utils.parse_device_parameters()
