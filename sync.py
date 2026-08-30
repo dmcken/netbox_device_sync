@@ -301,7 +301,16 @@ def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.Drive
     # - Interfaces:
     # -- flag the routing instance / logical systems (use VRF to keep track of this)
     # -- On SRXes use tags to flag the security-zones
-    nb_interfaces = nb.dcim.interfaces.filter(device=device_nb.name)
+    # pynetbox's RecordSet is a one-shot iterator - a plain list is
+    # needed here since this gets iterated multiple times below (once
+    # to build nb_interface_dict, again for nb_interfaces_names, and
+    # again for the stale-interface delete pass at the end). Confirmed
+    # live that leaving it as the RecordSet made every iteration past
+    # the first come back empty, so nb_interfaces_names was always an
+    # empty set - not just an inaccurate debug log line, but silently
+    # disabling the delete pass below entirely, for every device, ever
+    # since it was written.
+    nb_interfaces = list(nb.dcim.interfaces.filter(device=device_nb.name))
     nb_interface_dict = {v.name:v for v in nb_interfaces}
     nb_interfaces_names = set(map(lambda x: x.name, nb_interfaces))
     dev_interfaces = device_conn.get_interfaces()
