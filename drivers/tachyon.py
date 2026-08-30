@@ -60,12 +60,17 @@ _PEER_SLOT_RE = re.compile(r'^prs\d+$')
 
 
 class Tachyon(drivers.base.DriverBase):
-    '''Tachyon Networks device driver (confirmed live: TNS-100, TNA-303X).'''
+    '''Tachyon Networks device driver (confirmed live: TNS-100, TNA-303X).
+
+    Uses its own dedicated DEV_TACH_USERNAME/DEV_TACH_PASSWORD
+    credential rather than the shared DEV_USERNAME/DEV_PASSWORD used by
+    most other drivers - see .env.example.
+    '''
 
     _connect_params = {
-        'hostname': {'dest': 'host'},
-        'username': {'dest': 'username'},
-        'password': {'dest': 'password'},
+        'hostname':      {'dest': 'host'},
+        'tach_username': {'dest': 'username'},
+        'tach_password': {'dest': 'password'},
     }
 
     def _connect(self, host: str, username: str, password: str) -> None:
