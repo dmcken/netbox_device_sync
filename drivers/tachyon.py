@@ -1,25 +1,36 @@
 '''Driver for Tachyon Networks devices - a session-cookie authenticated
 JSON REST API under /cgi.lua/*.
 
-Confirmed live against a real TNS-100 (firmux 1.12.6, serial
-TNS1001252300369): a 6-port PoE distribution switch (5x 2.5GbE PoE +
-1x 10GbE SFP+ uplink) deployed at a tower site, feeding sector radios
-and uplinking to the site router - not a wireless radio itself
-(capabilities()'s own `radios` block is empty on this unit). Other
-Tachyon product lines (wireless radios) aren't covered here yet.
+Confirmed live against two real units, sharing the same API family
+(same Xavante-served /cgi.lua/* surface, different app.jsx builds):
+
+- A TNS-100 (firmux 1.12.6, serial TNS1001252300369): a 6-port PoE
+  distribution switch (5x 2.5GbE PoE + 1x 10GbE SFP+ uplink) deployed
+  at a tower site, feeding sector radios and uplinking to the site
+  router - not a wireless radio itself (capabilities()'s own `radios`
+  block is empty on this unit).
+- A TNA-303X (firmux 1.12.2, serial TNA3031422400137): a 60GHz PtMP
+  sector radio (one `wlan0` radio, capabilities()'s `radios` block
+  confirms band/vendor), bridging its one wireless VAP with a 2-port
+  copper failover pair (eth0/eth1, sharing one internal switch chip -
+  unlike the TNS-100's flat per-port capabilities, this one nests
+  multiple physical sub-ports under a single logical port name, so its
+  capabilities() speed isn't trustworthy for per-interface type
+  detection - see _SFP_PORT_TYPE's use below).
 
 /cgi.lua/config is only readable by an admin-level (level 0) account -
 confirmed live that a read-only (level 9) account gets a 401 on it
 (and on /cgi.lua/config_installer, the level-9 equivalent) even though
 it can read /cgi.lua/status and /cgi.lua/capabilities freely. config()
-is the only source of this device's configured VLANs, so an admin
-account is needed for get_vlans() to return anything - everything else
-this driver needs (interfaces, IPs, port media type) is available at
+is the only source of this device's configured VLANs (and, on a radio,
+its live wireless PSK) - everything else this driver needs (interfaces,
+IPs, port media type, wireless frequency/channel/role) is available at
 either privilege level.
 '''
 # System imports
 import ipaddress
 import logging
+import re
 
 # External imports
 import requests
@@ -30,15 +41,26 @@ import drivers.base
 logger = logging.getLogger(__name__)
 
 # capabilities()'s per-port `speed` (10000 vs 2500) is what actually
-# distinguishes the one SFP+ cage from the copper PoE ports - confirmed
-# live rather than assumed by port name, since a different TNS-100 unit
-# could plausibly number its ports differently.
+# distinguishes the TNS-100's one SFP+ cage from its copper PoE ports -
+# confirmed live rather than assumed by port name, since a different
+# unit could plausibly number its ports differently. Only trustworthy
+# when that port's capabilities entry describes a single physical port
+# directly (no nested `ports` sub-array - see get_interfaces()).
 _SFP_PORT_TYPE = '10gbase-x-sfpp'
 _COPPER_PORT_TYPE = '2.5gbase-t'
 
+# Confirmed live on a TNA-303X: 32 pre-allocated per-peer-slot pseudo
+# interfaces ("prs0".."prs31", matching its PtMP radio's maxPeerCount)
+# always show up in status() regardless of how many peers are actually
+# connected right now - all with a link-local-only IPv6 address and no
+# real traffic. Not real interfaces (never appear in config() at all),
+# so excluded here rather than left to be silently dropped downstream
+# by the global link-local IP filter.
+_PEER_SLOT_RE = re.compile(r'^prs\d+$')
+
 
 class Tachyon(drivers.base.DriverBase):
-    '''Tachyon Networks device driver (confirmed live: TNS-100).'''
+    '''Tachyon Networks device driver (confirmed live: TNS-100, TNA-303X).'''
 
     _connect_params = {
         'hostname': {'dest': 'host'},
@@ -108,7 +130,7 @@ class Tachyon(drivers.base.DriverBase):
         if 'status' not in self._cache:
             rez = self._session.get(
                 self._url('cgi.lua/status'),
-                params={'type': 'network,interfaces,ethernet,system'},
+                params={'type': 'network,interfaces,ethernet,system,wireless'},
                 timeout=30,
             )
             rez.raise_for_status()
@@ -116,16 +138,19 @@ class Tachyon(drivers.base.DriverBase):
         return self._cache['status']
 
     def get_interfaces(self) -> list[drivers.base.Interface]:
-        config_ports = self._fetch_config().get('ethernet', {}).get('ports', {})
+        config = self._fetch_config()
+        config_ports = config.get('ethernet', {}).get('ports', {})
+        config_radios = config.get('wireless', {}).get('radios', {})
         status_by_name = self._fetch_status().get('interfaces', {})
         capabilities_ports = self._fetch_capabilities().get('ports', {})
 
         interfaces = []
 
-        # The bridge all physical ports belong to, and the interface
-        # this device's own routable IP actually sits on - built first,
-        # matching the bridges/parents-before-members ordering used
-        # elsewhere in this project.
+        # The bridge all physical ports (and, on a radio, its wireless
+        # VAP too) belong to, and the interface this device's own
+        # routable IP actually sits on - built first, matching the
+        # bridges/parents-before-members ordering used elsewhere in
+        # this project.
         bridge_status = status_by_name.get('br-wan', {})
         bridge_mac = bridge_status.get('mac_address')
         interfaces.append(drivers.base.Interface(
@@ -138,7 +163,18 @@ class Tachyon(drivers.base.DriverBase):
         for name, port_config in config_ports.items():
             port_status = status_by_name.get(name, {})
             port_mac = port_status.get('mac_address')
-            port_speed = capabilities_ports.get(name, {}).get('speed')
+            port_caps = capabilities_ports.get(name, {})
+
+            if 'ports' in port_caps:
+                # Confirmed live on a TNA-303X: this name is actually a
+                # 2-port switch chip (its own `ports` sub-array lists
+                # each physical port's own speed), so the top-level
+                # `speed` here doesn't reliably describe this single
+                # logical interface - don't guess a specific type from
+                # it, unlike the TNS-100's flat per-port capabilities.
+                port_type = None
+            else:
+                port_type = _SFP_PORT_TYPE if port_caps.get('speed') == 10000 else _COPPER_PORT_TYPE
 
             interfaces.append(drivers.base.Interface(
                 name=name,
@@ -146,7 +182,24 @@ class Tachyon(drivers.base.DriverBase):
                 description=port_config.get('note') or None,
                 mac_address=[port_mac] if port_mac else [],
                 mtu=port_config.get('mtu'),
-                type=_SFP_PORT_TYPE if port_speed == 10000 else _COPPER_PORT_TYPE,
+                type=port_type,
+            ))
+
+        for name in config_radios:
+            radio_status = status_by_name.get(name, {})
+            radio_mac = radio_status.get('mac_address')
+
+            interfaces.append(drivers.base.Interface(
+                name=name,
+                bridge='br-wan',
+                mac_address=[radio_mac] if radio_mac else [],
+                mtu=radio_status.get('mtu'),
+                # Left unset (rather than guessed at a specific 802.11
+                # standard - this is 60GHz 802.11ad on the TNA-303X, but
+                # NetBox has no matching wireless PHY choice for that)
+                # - sync_wireless()'s _ensure_wireless_type() bumps this
+                # to 'other-wireless' itself once it processes this
+                # radio's WirelessRadio data, same as every other driver.
             ))
 
         return interfaces
@@ -167,7 +220,7 @@ class Tachyon(drivers.base.DriverBase):
 
         addresses = []
         for name, iface_status in status.get('interfaces', {}).items():
-            if name == 'lo':
+            if name == 'lo' or _PEER_SLOT_RE.match(name):
                 continue
 
             raw_addresses = [
@@ -199,3 +252,69 @@ class Tachyon(drivers.base.DriverBase):
             )
             for vlan in zone.get('vlans', [])
         ]
+
+    def get_wireless_radios(self) -> list[drivers.base.WirelessRadio]:
+        '''This device's own wireless radio(s) - none on a TNS-100
+        (config().wireless is absent entirely), one (`wlan0`, 60GHz,
+        PtMP AP) confirmed live on a TNA-303X.
+
+        Radio-level frequency/channel width comes from status() (the
+        device's live report); SSID/security/PSK come from config()'s
+        per-VAP entry (status() only has a human-readable `security`
+        summary string, not the actual PSK). A radio can carry more
+        than one VAP (multiple SSIDs) - config's and status's VAP lists
+        are correlated by position within the same radio's list, since
+        neither side gives them an explicit shared id and this hasn't
+        been confirmed live against a unit with more than one VAP.
+
+        Peer parsing (peers[].mac/hostname below) is a best-effort
+        guess at the field names, NOT confirmed live - the one unit
+        available while writing this had zero connected peers
+        (peerCount: 0), so there was nothing real to check the shape
+        against. Defensive .get() throughout means a wrong guess just
+        yields fewer/no peers rather than a crash; revisit once a real
+        connected CPE is available.
+        '''
+        config_radios = self._fetch_config().get('wireless', {}).get('radios', {})
+        if not config_radios:
+            return []
+
+        status_wireless = self._fetch_status().get('wireless', {})
+        status_radios = status_wireless.get('radios', {})
+        live_peers = status_wireless.get('peers', [])
+
+        status_vaps_by_radio: dict[str, list[dict]] = {}
+        for vap in status_wireless.get('vaps', []):
+            status_vaps_by_radio.setdefault(vap.get('radio'), []).append(vap)
+
+        peers = []
+        for peer in live_peers:
+            mac = peer.get('mac')
+            if not mac:
+                continue
+            peers.append(drivers.base.WirelessPeer(mac=mac, hostname=peer.get('hostname')))
+
+        radios = []
+        for radio_name, radio_config in config_radios.items():
+            radio_status = status_radios.get(radio_name, {})
+            status_vaps = status_vaps_by_radio.get(radio_name, [])
+
+            for idx, vap_config in enumerate(radio_config.get('vaps', [])):
+                vap_status = status_vaps[idx] if idx < len(status_vaps) else {}
+                passphrase = vap_config.get('security', {}).get('wpapsk', {}).get('passphrase')
+
+                radios.append(drivers.base.WirelessRadio(
+                    interface=radio_name,
+                    # 'master' is this device's own confirmed-live AP
+                    # role string (operationMode) - anything else is
+                    # left unset rather than guessed at 'station'.
+                    role='ap' if vap_status.get('operationMode') == 'master' else None,
+                    ssid=vap_config.get('ssid'),
+                    frequency_mhz=radio_status.get('frequency'),
+                    channel_width_mhz=radio_status.get('channelWidth'),
+                    security=vap_status.get('security'),
+                    psk=passphrase,
+                    peers=peers,
+                ))
+
+        return radios

@@ -27,7 +27,12 @@ networks_to_ignore = [
     # ipaddress._IPv6Constants
     ipaddress.ip_network('127.0.0.0/8'), # IPv4 Loopback
     ipaddress.ip_network('::1/128'),     # IPv6 Loopback
-    ipaddress.ip_network('FE80::/10'),   # Link local
+    ipaddress.ip_network('FE80::/10'),   # Link local (IPv6)
+    # Link local (IPv4, RFC 3927) - confirmed live that a Tachyon
+    # TNA-303X's fixed local-recovery address (config's alt_local_ip,
+    # 169.254.1.1/16) sits in here, same "fixed convenience address,
+    # not a real per-device one" reasoning as the AirFiber entry below.
+    ipaddress.ip_network('169.254.0.0/16'),
     # Shared local-management convenience address seen identically
     # configured on multiple independent AirFiber units' secondary
     # bridge (br2) - not a real per-device address, so not something
