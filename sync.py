@@ -625,6 +625,39 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
 
     return
 
+def _ensure_primary_ip(nb_api: pynetbox.api, device_nb, device_ip: str) -> None:
+    """If this device's primary_ip4/6 is missing, point it back at the
+    address sync.py is actually using to reach it right now (device_ip
+    - the same address device_nb.primary_ip held at the start of this
+    run), if a matching IP record still exists on one of the device's
+    own interfaces.
+
+    Confirmed live that this can happen as a side effect of the stale-
+    interface delete pass in sync_interfaces(): if a device's primary
+    IP had been sitting on an interface the live device no longer
+    reports (e.g. a leftover bridge from before this device had a real
+    driver), deleting that stale interface deletes the IP address
+    record with it, silently clearing the device's primary_ip4/6 - and
+    since main()'s own device filter skips any device with no primary
+    IP at all, a device this happens to would otherwise never get
+    synced again.
+    """
+    is_v6 = ipaddress.ip_address(device_ip).version == 6
+    primary_field = 'primary_ip6' if is_v6 else 'primary_ip4'
+    if getattr(device_nb, primary_field) is not None:
+        return
+
+    candidates = [
+        ip for ip in nb_api.ipam.ip_addresses.filter(device=device_nb.name)
+        if str(ipaddress.ip_interface(ip.address).ip) == device_ip
+    ]
+    if not candidates:
+        return
+
+    setattr(device_nb, primary_field, candidates[0].id)
+    device_nb.save()
+    logger.info(f"Restored {primary_field} on '{device_nb.name}' -> {candidates[0].address}")
+
 def sync_site_gps(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
     """Backfill a Site's GPS location from a device with built-in GPS.
 
@@ -1403,6 +1436,7 @@ def main() -> None:
             # Now to sync the data
             sync_interfaces(nb_api, device_nb, device_conn)
             sync_ips(nb_api, device_nb, device_conn)
+            _ensure_primary_ip(nb_api, device_nb, device_ip)
             sync_site_gps(nb_api, device_nb, device_conn)
             sync_wireless(nb_api, device_nb, device_conn)
             # sync_neighbours(nb_api, device_nb, device_conn)
