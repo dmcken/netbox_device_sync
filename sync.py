@@ -374,7 +374,20 @@ def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.Drive
     # Delete extra interfaces in netbox that are no longer on the device.
     nb_interfaces_to_delete = filter(lambda x: x.name in to_delete_from_nb, nb_interfaces)
     for curr_int_to_delete in nb_interfaces_to_delete:
-        curr_int_to_delete.delete()
+        try:
+            curr_int_to_delete.delete()
+        except pynetbox.core.query.RequestError as exc:
+            # Confirmed live: a stale interface can still be referenced
+            # by a WirelessLink NetBox won't let get cascade-deleted
+            # (409 Conflict, "N dependent objects were found") - skip it
+            # rather than letting this abort the rest of this device's
+            # sync (IPs/GPS/wireless), since this exception previously
+            # propagated all the way out of sync_interfaces() to
+            # main()'s per-device try/except.
+            logger.warning(
+                f"Could not delete stale interface '{curr_int_to_delete.name}' on "
+                f"'{device_nb.name}': {exc}"
+            )
 
 def _vrrp_role(interface_name: str) -> str | None:
     """Netbox IP-address role to tag a VRRP virtual IP with, or None.
