@@ -97,6 +97,36 @@ class GPSCoordinate:
     longitude: float
     altitude_m: float = None
 
+@dataclasses.dataclass
+class WirelessPeer:
+    '''One peer currently linked to a WirelessRadio - the far end of a
+    point-to-point link, or one client of a point-to-multipoint AP.'''
+    mac: str
+    hostname: str = None
+
+@dataclasses.dataclass
+class WirelessRadio:
+    '''A device's own wireless radio - its configuration plus whichever
+    peer(s) are currently linked to it.
+
+    A radio with exactly one peer is one end of a point-to-point link;
+    a radio with more than one peer is the AP side of a point-to-
+    multipoint network. A radio the driver reports with an empty peers
+    list still has its own rf_role/frequency/channel width set on
+    NetBox - it just has nothing currently connected to link/associate
+    it to.
+    '''
+    interface: str                     # this device's own interface name
+    role: str = None                   # 'ap' / 'station' / None if undetermined
+    ssid: str = None
+    frequency_mhz: int = None
+    channel_width_mhz: int = None
+    security: str = None               # raw device string - mapped to
+                                        # NetBox's auth_type vocabulary by
+                                        # the caller, not the driver
+    psk: str = None
+    peers: list[WirelessPeer] = None
+
 # Factories
 class DriverFactory:
     """Base factory for all driver objects"""
@@ -273,3 +303,15 @@ class DriverBase(metaclass = abc.ABCMeta):
             GPSCoordinate | None: This device's GPS location.
         """
         return None
+
+    def get_wireless_radios(self,) -> list[WirelessRadio]:
+        """Get this device's own wireless radio(s) - configuration plus
+        whichever peer(s) are currently linked to each one.
+
+        Return a blank list if the driver doesn't implement this
+        function, or the device has no wireless radios at all.
+
+        Returns:
+            list[WirelessRadio]: This device's wireless radios.
+        """
+        return []

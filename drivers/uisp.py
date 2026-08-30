@@ -207,3 +207,97 @@ class Uisp(drivers.base.DriverBase):
             longitude=gps.longitude,
             altitude_m=gps.altitude_m,
         )
+
+    def _fetch_wireless_config(self) -> dict:
+        '''Fetch tools/compose's /system/airos/configuration sub-route
+        (ssid/encryption/apMode per radio), with caching.'''
+        if 'wireless_config' not in self._cache:
+            composed = self._dev.compose(['/system/airos/configuration'])
+            self._cache['wireless_config'] = composed.get(
+                '/system/airos/configuration', {}
+            ).get('wireless', {}).get('interfaces', [])
+        return self._cache['wireless_config']
+
+    @staticmethod
+    def _match_radio(interface_name: str, radios: list[dict]) -> dict | None:
+        '''Match a wireless-type Interface to its statistics.wireless
+        radio entry.
+
+        Confirmed live across several Wave AP/Pro/LR units: a device's
+        wireless-type interfaces (from get_interfaces()) always number
+        1 or 2 - if 2, one's identification.name always contains
+        "Backup" (e.g. "5 GHz Backup", vs. the other's "60 GHz") and
+        correlates 1:1 with the radio entry whose own id is literally
+        "backup" (statistics.wireless.radios[].id, also confirmed to be
+        "main" for the non-backup one). This is what makes it possible
+        to attribute frequency/channel width to a *specific* interface
+        at all on dual-radio hardware - matching by MAC doesn't work
+        here, since both interfaces report the identical MAC.
+        '''
+        if len(radios) == 1:
+            return radios[0]
+
+        is_backup = 'backup' in (interface_name or '').lower()
+        for radio in radios:
+            if (radio.get('id') == 'backup') == is_backup:
+                return radio
+        return None
+
+    def get_wireless_radios(self) -> list[drivers.base.WirelessRadio]:
+        '''This device's own wireless radio(s), plus whichever peer(s)
+        are currently linked to each one (one for a PtP link, several
+        for a PtMP AP). Returns one entry per radio - EdgePower and
+        similar wired-only devices simply have no wireless-type
+        interfaces at all, so return an empty list for those, checked
+        first (before fetching statistics/wireless config at all) since
+        confirmed live that composing /system/airos/configuration on a
+        device with no radio hardware at all just logs a spurious
+        internal 404 for nothing.
+        '''
+        wireless_interfaces = [
+            raw for raw in self._fetch_interfaces()
+            if raw['identification'].get('type') == 'wireless'
+        ]
+        if not wireless_interfaces:
+            return []
+
+        stats = self._dev.getstatistics()
+        wireless = stats.get('wireless', {})
+        radios = wireless.get('radios', [])
+        radio_configs = {c.get('id'): c for c in self._fetch_wireless_config()}
+
+        peers_by_radio_id: dict[str, list[drivers.base.WirelessPeer]] = {}
+        for peer in wireless.get('peers', []):
+            common = peer.get('common', {})
+            identification = common.get('identification', {})
+            mac = identification.get('mac')
+            hostname = common.get('hostname') or identification.get('hostname')
+            for local in peer.get('local', []):
+                if local.get('connected') and mac:
+                    peers_by_radio_id.setdefault(local['id'], []).append(
+                        drivers.base.WirelessPeer(mac=mac, hostname=hostname)
+                    )
+
+        wireless_radios = []
+        for raw in wireless_interfaces:
+            identification = raw['identification']
+
+            radio = self._match_radio(identification.get('name'), radios)
+            config = radio_configs.get(radio['id']) if radio else None
+
+            encryption = (config or {}).get('encryption', {})
+            frequency = (radio or {}).get('frequency', {})
+            channel_width = (radio or {}).get('channelWidth', {})
+
+            wireless_radios.append(drivers.base.WirelessRadio(
+                interface=identification['id'],
+                role='ap' if (config or {}).get('apMode') else 'station',
+                ssid=(config or {}).get('ssid'),
+                frequency_mhz=frequency.get('center'),
+                channel_width_mhz=channel_width.get('tx'),
+                security=encryption.get('type'),
+                psk=encryption.get('passphrase'),
+                peers=peers_by_radio_id.get((radio or {}).get('id'), []),
+            ))
+
+        return wireless_radios

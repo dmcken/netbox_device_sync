@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import os
 import pprint
+import re
 import sys
 import traceback
 
@@ -32,6 +33,22 @@ import utils
 dotenv.load_dotenv()
 
 LOGGING_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# NetBox's wireless-category Interface.type values - rf_role/rf_channel_*
+# can only be set on an interface whose type is one of these.
+_WIRELESS_INTERFACE_TYPES = {
+    'ieee802.11a', 'ieee802.11g', 'ieee802.11n', 'ieee802.11ac',
+    'ieee802.11ad', 'ieee802.11ax', 'ieee802.11ay', 'ieee802.11be',
+    'other-wireless',
+}
+
+# Manual cabling-documentation convention already in use fleet-wide, e.g.
+# an interface description of "FIB-IE1 [sfp-sfpplus1]" means the far end
+# of the cable is that device's named port. Matched as a prefix, not the
+# whole description - confirmed live that some descriptions have trailing
+# text after the bracket (e.g. "DAN-SW0031 [sfp-sfpplus2] / Was Roylances
+# UXG"). See sync_cable_descriptions().
+_CABLE_DESC_RE = re.compile(r'^([^\[\]]+?)\s*\[([^\[\]]+)\]')
 
 logger = logging.getLogger(__name__)
 
@@ -492,6 +509,363 @@ def sync_site_gps(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.Dri
     site.longitude = gps.longitude
     site.save()
 
+def _map_auth_type(security: str) -> str | None:
+    """Map a device's raw wireless security string to NetBox's auth_type
+    vocabulary (open/wep/wpa-personal/wpa-enterprise).
+
+    Confirmed live: AirOS/AirFiber report e.g. "WPA-PSK"/"WPA2", UISP
+    reports e.g. "wpa2" - none of the devices synced this pass exposed
+    an explicit "enterprise"/802.1X indicator, so this only ever maps to
+    open/wep/wpa-personal. Returns None (leave unset) rather than
+    guessing for anything else.
+    """
+    if not security:
+        return None
+
+    security_upper = security.upper()
+    if 'ENTERPRISE' in security_upper:
+        return 'wpa-enterprise'
+    if 'WPA' in security_upper:
+        return 'wpa-personal'
+    if 'WEP' in security_upper:
+        return 'wep'
+    if security_upper in ('NONE', 'OPEN', 'DISABLED'):
+        return 'open'
+    return None
+
+def _find_interface_by_mac(nb_api: pynetbox.api, mac_str: str):
+    """Find the NetBox interface a MAC address is currently assigned to.
+
+    Read-only lookup, unlike fetch_nb_mac() - a peer's MAC not already
+    known to NetBox just means that device isn't tracked yet, not
+    something to create a bare MAC record for.
+
+    Args:
+        nb_api (pynetbox.api): Netbox API connection.
+        mac_str (str): MAC address to look up.
+
+    Returns:
+        The interface record, or None if the MAC is unknown or isn't
+        currently assigned to any interface.
+    """
+    mac_obj = nb_api.dcim.mac_addresses.get(mac_address=utils.clean_mac(mac_str))
+    if mac_obj is None or mac_obj.assigned_object_type != 'dcim.interface':
+        return None
+
+    return nb_api.dcim.interfaces.get(id=mac_obj.assigned_object_id)
+
+def _ensure_wireless_type(nb_interface) -> None:
+    """NetBox rejects rf_role/rf_channel_*, and rejects a WirelessLink/
+    WirelessLAN membership entirely, on an interface whose own `type`
+    isn't already one of its wireless PHY types (confirmed live:
+    {'rf_role': ['Wireless role may be set only on wireless
+    interfaces.']} and {'interface_b': ['Other is not a wireless
+    interface.']}). Sets the generic 'other-wireless' rather than
+    guessing a specific 802.11 standard, and only when the type isn't
+    already a wireless one (don't clobber a more specific value someone
+    already set).
+    """
+    curr_type = nb_interface.type.value if nb_interface.type else None
+    if curr_type not in _WIRELESS_INTERFACE_TYPES:
+        nb_interface.type = 'other-wireless'
+        nb_interface.save()
+
+def _best_matching_wireless_interface(nb_api: pynetbox.api, peer_interface, expected_frequency_mhz):
+    """Disambiguate which of a peer device's wireless interfaces a MAC
+    match actually refers to.
+
+    Confirmed live on Wave Pro/LR dual-radio hardware: both of a
+    device's wireless-type interfaces (its 60 GHz "main" and 5 GHz
+    "backup" radio) report the *identical* MAC, so a MAC-only lookup
+    can resolve to the wrong one of the pair (whichever interface
+    happened to keep that shared MAC when interfaces were originally
+    synced) - confirmed live to actually pair a 66960 MHz local radio
+    with a peer interface still carrying its sibling's 5260 MHz.
+
+    Self-corrects across runs rather than needing to be right the first
+    time: once both ends of a link have been synced at least once, each
+    interface's own rf_channel_frequency is already populated, so this
+    can prefer whichever sibling wireless interface on the peer's
+    device is actually closest in frequency to the radio being linked,
+    rather than trusting the MAC match blindly. On a device's first-
+    ever sync there's nothing populated yet to compare against, so this
+    falls back to the naive MAC match for that one pass.
+    """
+    if not expected_frequency_mhz:
+        return peer_interface
+
+    wireless_siblings = [
+        i for i in nb_api.dcim.interfaces.filter(device_id=peer_interface.device.id)
+        if i.type and i.type.value in _WIRELESS_INTERFACE_TYPES and i.rf_channel_frequency
+    ]
+    if len(wireless_siblings) <= 1:
+        return peer_interface
+
+    return min(
+        wireless_siblings,
+        key=lambda i: abs(i.rf_channel_frequency - expected_frequency_mhz),
+    )
+
+def _find_wireless_link(nb_api: pynetbox.api, interface_a, interface_b):
+    """Find an existing WirelessLink connecting two interfaces, in
+    either order - either side's sync run could have created it first.
+    """
+    for link in nb_api.wireless.wireless_links.filter(interface_a_id=interface_a.id):
+        if link.interface_b.id == interface_b.id:
+            return link
+
+    for link in nb_api.wireless.wireless_links.filter(interface_a_id=interface_b.id):
+        if link.interface_b.id == interface_a.id:
+            return link
+
+    return None
+
+def _sync_wireless_link(
+    nb_api: pynetbox.api, device_nb, nb_interface, radio: drivers.base.WirelessRadio,
+    auth_type: str | None,
+) -> None:
+    """Sync a point-to-point wireless link (a radio with exactly one
+    currently-linked peer) - find-or-create its WirelessLink and fill
+    in whichever of ssid/auth_type/auth_psk are currently empty.
+    status is always set to 'connected', since reaching this code path
+    at all means the device reports a live peer right now - unlike
+    ssid/auth, that's an observation, not a fact someone might have
+    deliberately set differently by hand.
+    """
+    peer = radio.peers[0]
+    peer_interface = _find_interface_by_mac(nb_api, peer.mac)
+    if peer_interface is None:
+        logger.warning(
+            f"Could not match PtP peer '{peer.hostname}' ({peer.mac}) for "
+            f"'{device_nb.name}'/{radio.interface} to any NetBox interface"
+        )
+        return
+
+    if peer_interface.device.id == device_nb.id:
+        # A stale/self-referential MAC assignment - not a real peer.
+        return
+
+    peer_interface = _best_matching_wireless_interface(
+        nb_api, peer_interface, radio.frequency_mhz,
+    )
+    _ensure_wireless_type(peer_interface)
+
+    link = _find_wireless_link(nb_api, nb_interface, peer_interface)
+    if link is None:
+        link = nb_api.wireless.wireless_links.create(
+            interface_a=nb_interface.id,
+            interface_b=peer_interface.id,
+        )
+        logger.info(
+            f"Created WirelessLink '{device_nb.name}'/{radio.interface} <-> "
+            f"'{peer_interface.device.name}'/{peer_interface.name}"
+        )
+
+    changed = {}
+    if not link.ssid and radio.ssid:
+        changed['ssid'] = radio.ssid
+    if not link.status or link.status.value != 'connected':
+        changed['status'] = 'connected'
+    if auth_type and (not link.auth_type or link.auth_type.value != auth_type):
+        changed['auth_type'] = auth_type
+    if radio.psk and not link.auth_psk:
+        changed['auth_psk'] = radio.psk
+
+    if changed:
+        for key, value in changed.items():
+            setattr(link, key, value)
+        link.save()
+        logger.info(f"Updated WirelessLink {link.id}: {list(changed.keys())}")
+
+def _sync_wireless_lan(
+    nb_api: pynetbox.api, device_nb, nb_interface, radio: drivers.base.WirelessRadio,
+    auth_type: str | None,
+) -> None:
+    """Sync a point-to-multipoint network (a radio with more than one
+    currently-linked peer) - find-or-create its WirelessLAN (keyed on
+    ssid), associate this AP's own interface, and associate whichever
+    peers resolve to a NetBox interface.
+    """
+    if not radio.ssid:
+        logger.error(
+            f"PtMP AP '{device_nb.name}'/{radio.interface} has no ssid - "
+            "can't find/create its WirelessLAN"
+        )
+        return
+
+    wlan = next(iter(nb_api.wireless.wireless_lans.filter(ssid=radio.ssid)), None)
+    if wlan is None:
+        wlan = nb_api.wireless.wireless_lans.create(ssid=radio.ssid)
+        logger.info(f"Created WirelessLAN '{radio.ssid}'")
+
+    changed = {}
+    if not wlan.status or wlan.status.value != 'active':
+        changed['status'] = 'active'
+    if auth_type and (not wlan.auth_type or wlan.auth_type.value != auth_type):
+        changed['auth_type'] = auth_type
+    if radio.psk and not wlan.auth_psk:
+        changed['auth_psk'] = radio.psk
+
+    if changed:
+        for key, value in changed.items():
+            setattr(wlan, key, value)
+        wlan.save()
+        logger.info(f"Updated WirelessLAN {wlan.id}: {list(changed.keys())}")
+
+    if wlan.id not in [w.id for w in nb_interface.wireless_lans]:
+        nb_interface.wireless_lans = [*[w.id for w in nb_interface.wireless_lans], wlan.id]
+        nb_interface.save()
+
+    for peer in radio.peers:
+        peer_interface = _find_interface_by_mac(nb_api, peer.mac)
+        if peer_interface is None:
+            logger.warning(
+                f"Could not match PtMP peer '{peer.hostname}' ({peer.mac}) on "
+                f"'{device_nb.name}'/{radio.interface} to any NetBox interface"
+            )
+            continue
+
+        if peer_interface.device.id == device_nb.id:
+            continue
+
+        peer_interface = _best_matching_wireless_interface(
+            nb_api, peer_interface, radio.frequency_mhz,
+        )
+        _ensure_wireless_type(peer_interface)
+
+        existing_ids = [w.id for w in peer_interface.wireless_lans]
+        if wlan.id not in existing_ids:
+            peer_interface.wireless_lans = [*existing_ids, wlan.id]
+            peer_interface.save()
+
+def sync_wireless(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
+    """Sync wireless frequency/channel data and PtP/PtMP connections.
+
+    A radio with exactly one currently-linked peer is one end of a
+    point-to-point link (WirelessLink); more than one peer means this
+    device is the AP side of a point-to-multipoint network
+    (WirelessLAN). Device is authoritative for rf_role/frequency/
+    channel width - always updated. ssid/auth_type/auth_psk on an
+    existing WirelessLink/WirelessLAN are only filled in if currently
+    empty, so a value someone already set by hand for their own reason
+    is never overwritten.
+
+    Args:
+        nb_api (pynetbox.api): Netbox API connection.
+        device_nb (_type_): The device from netbox's perspective.
+        device_conn (drivers.base.DriverBase): _description_
+    """
+    for radio in device_conn.get_wireless_radios():
+        nb_interface = nb_api.dcim.interfaces.get(device=device_nb.name, name=radio.interface)
+        if nb_interface is None:
+            logger.error(
+                f"Wireless radio interface '{radio.interface}' not found on "
+                f"'{device_nb.name}' - was it created by sync_interfaces()?"
+            )
+            continue
+
+        _ensure_wireless_type(nb_interface)
+
+        changed = {}
+        curr_rf_role = nb_interface.rf_role.value if nb_interface.rf_role else None
+        if radio.role in ('ap', 'station') and curr_rf_role != radio.role:
+            changed['rf_role'] = radio.role
+        if radio.frequency_mhz and nb_interface.rf_channel_frequency != radio.frequency_mhz:
+            changed['rf_channel_frequency'] = radio.frequency_mhz
+        if radio.channel_width_mhz and nb_interface.rf_channel_width != radio.channel_width_mhz:
+            changed['rf_channel_width'] = radio.channel_width_mhz
+
+        if changed:
+            for key, value in changed.items():
+                setattr(nb_interface, key, value)
+            nb_interface.save()
+            logger.info(
+                f"Updated wireless config on '{device_nb.name}'/{radio.interface}: {changed}"
+            )
+
+        if not radio.peers:
+            continue
+
+        auth_type = _map_auth_type(radio.security)
+        if len(radio.peers) == 1:
+            _sync_wireless_link(nb_api, device_nb, nb_interface, radio, auth_type)
+        else:
+            _sync_wireless_lan(nb_api, device_nb, nb_interface, radio, auth_type)
+
+def sync_cable_descriptions(nb_api: pynetbox.api) -> None:
+    """Create Cables from the "<Device> [<Port>]" manual cabling
+    convention already used fleet-wide in interface descriptions - e.g.
+    "FIB-IE1 [sfp-sfpplus1]" means the far end of this interface's
+    cable is that device's named port.
+
+    Not driven by any live device - this is pure NetBox metadata
+    already entered by hand, so it's run once per sync.py invocation
+    (not per-device like sync_interfaces()/sync_wireless()/etc.),
+    scanning every interface in NetBox regardless of platform.
+
+    If the named device or port doesn't exist, or either end already
+    has a cable, the description is left alone and skipped - never
+    treated as an error, since this convention predates (and partially
+    overlaps with) actual Cable records already existing for some of
+    these interfaces.
+    """
+    for interface in nb_api.dcim.interfaces.all():
+        if not interface.description or interface.cable:
+            continue
+
+        match = _CABLE_DESC_RE.match(interface.description)
+        if not match:
+            continue
+
+        remote_device_name = match.group(1).strip()
+        remote_port_name = match.group(2).strip()
+
+        # A single lookup covers both "ignore" conditions at once - a
+        # nonexistent port on a real device just comes back as no result,
+        # but confirmed live that a nonexistent *device* name makes
+        # NetBox's own filter validation reject the whole request instead
+        # of returning zero results, so that has to be caught too.
+        try:
+            remote_interface = nb_api.dcim.interfaces.get(
+                device=remote_device_name, name=remote_port_name,
+            )
+        except pynetbox.core.query.RequestError:
+            remote_interface = None
+
+        if remote_interface is None:
+            logger.debug(
+                f"Cabling description '{interface.description}' on "
+                f"'{interface.device.name}'/{interface.name} doesn't resolve "
+                "to a real device/port - ignoring"
+            )
+            continue
+
+        if remote_interface.id == interface.id or remote_interface.cable:
+            continue
+
+        try:
+            nb_api.dcim.cables.create(
+                a_terminations=[{'object_type': 'dcim.interface', 'object_id': interface.id}],
+                b_terminations=[
+                    {'object_type': 'dcim.interface', 'object_id': remote_interface.id}
+                ],
+                status='connected',
+            )
+        except pynetbox.core.query.RequestError as exc:
+            # Most likely the other end's own pass through this same loop
+            # already cabled it (both sides commonly carry matching
+            # descriptions) - our in-memory copy just hadn't seen it yet.
+            logger.debug(
+                f"Could not create cable '{interface.device.name}'/{interface.name} <-> "
+                f"'{remote_device_name}'/{remote_port_name}: {exc}"
+            )
+            continue
+
+        logger.info(
+            f"Created cable '{interface.device.name}'/{interface.name} <-> "
+            f"'{remote_device_name}'/{remote_port_name}"
+        )
+
 def sync_neighbours(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
     """Sync neighbour data.
 
@@ -669,6 +1043,7 @@ def main() -> None:
             sync_interfaces(nb_api, device_nb, device_conn)
             sync_ips(nb_api, device_nb, device_conn)
             sync_site_gps(nb_api, device_nb, device_conn)
+            sync_wireless(nb_api, device_nb, device_conn)
             # sync_neighbours(nb_api, device_nb, device_conn)
 
             # To Sync
@@ -698,6 +1073,10 @@ def main() -> None:
             logger.error(pprint.pformat(
                 traceback.format_exception(exc_type, exc_value, exc_traceback)
             ))
+
+    # Not driven by any live device - runs once against NetBox's existing
+    # interface descriptions, not per-device like the sync above.
+    sync_cable_descriptions(nb_api)
 
     logger.info("Done")
 

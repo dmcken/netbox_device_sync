@@ -227,3 +227,68 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
             longitude=gps.longitude,
             altitude_m=gps.altitude_m,
         )
+
+    def get_wireless_radios(self) -> list[drivers.base.WirelessRadio]:
+        '''This device's own radio, plus whichever peer(s) are currently
+        linked to it (one for a PtP link, several for a PtMP AP).
+
+        wireless.apmac does NOT match any interface's own hwaddr
+        (confirmed live on an airFiber 5X HD - some kind of virtual
+        BSSID, not the radio's real MAC), so the radio interface can't
+        be identified by MAC matching. Uses the interface name instead:
+        'ath0' if present, else 'wlan0' - confirmed live to be the
+        radio-facing interface across every AirOS/AirFiber unit tested,
+        unlike the wired/bridge names (eth0/ueth0/ueth1/br0/br2), which
+        vary by model. Returns nothing if this device has neither name,
+        rather than guessing which interface is the radio.
+        '''
+        status = self._fetch_status()
+        interface_names = {i['ifname'] for i in status.get('interfaces', [])}
+        radio_name = 'ath0' if 'ath0' in interface_names else (
+            'wlan0' if 'wlan0' in interface_names else None
+        )
+        if radio_name is None:
+            return []
+
+        wireless = status.get('wireless', {})
+        mode = wireless.get('mode', '')
+        role = 'ap' if mode.startswith('ap-') else (
+            'station' if mode.startswith('sta-') else None
+        )
+
+        peers = []
+        for sta in wireless.get('sta', []):
+            mac = sta.get('mac')
+            if not mac:
+                continue
+            peers.append(drivers.base.WirelessPeer(
+                mac=mac,
+                hostname=sta.get('remote', {}).get('hostname'),
+            ))
+
+        return [drivers.base.WirelessRadio(
+            interface=radio_name,
+            role=role,
+            ssid=wireless.get('essid'),
+            frequency_mhz=wireless.get('frequency'),
+            channel_width_mhz=wireless.get('chanbw'),
+            security=wireless.get('security'),
+            psk=self._find_psk(self._fetch_cfg()),
+            peers=peers,
+        )]
+
+    @staticmethod
+    def _find_psk(cfg: dict[str, str]) -> str | None:
+        '''Find the wireless PSK in getcfg()'s flat config.
+
+        The exact key varies by model/firmware - confirmed live as
+        'wireless.1.security.psk' on an AirFiber 5X HD, and (two
+        identical copies of) 'aaa.1.wpa.psk'/'wpasupplicant.profile.1.
+        network.1.psk' on an AirOSv8 Rocket Prism 5AC Gen2 - so this
+        just takes the first key ending in '.psk' rather than assuming
+        one exact path.
+        '''
+        for key, val in cfg.items():
+            if key.endswith('.psk'):
+                return val
+        return None
