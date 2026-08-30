@@ -272,10 +272,32 @@ class Uisp(drivers.base.DriverBase):
             identification = common.get('identification', {})
             mac = identification.get('mac')
             hostname = common.get('hostname') or identification.get('hostname')
+
+            peer_ips = None
+            mgmt_ip = common.get('mgmtIp')
+            if mgmt_ip:
+                try:
+                    peer_ips = [ipaddress.ip_interface(f"{mgmt_ip}/32")]
+                except ValueError:
+                    logger.error(f"Unable to parse peer address on '{mac}': {mgmt_ip}")
+
             for local in peer.get('local', []):
                 if local.get('connected') and mac:
                     peers_by_radio_id.setdefault(local['id'], []).append(
-                        drivers.base.WirelessPeer(mac=mac, hostname=hostname)
+                        drivers.base.WirelessPeer(
+                            mac=mac,
+                            hostname=hostname,
+                            # e.g. "Wave-Nano" - confirmed live. Used to
+                            # fuzzy-match a NetBox device type when
+                            # auto-provisioning a placeholder for a peer
+                            # with no existing NetBox interface.
+                            model=identification.get('model'),
+                            # No prefix reported (unlike this device's
+                            # own interfaces) - /32 records "this one
+                            # address exists" without inventing a
+                            # subnet. No IPv6 equivalent field seen.
+                            ip_addresses=peer_ips,
+                        )
                     )
 
         wireless_radios = []

@@ -868,29 +868,47 @@ def _sync_wireless_link(
 # PtP peer is expected to already be a real, separately-managed device.
 _CLIENT_DEVICE_CONVENTIONS = {
     'Tachyon': {'name_prefix': 'TACH-', 'manufacturer_slug': 'tachyon-networks'},
+    # "CUST-" already an existing (if inconsistently-applied) naming
+    # convention for manually-created Ubiquiti customer CPE placeholders
+    # in this fleet (e.g. "CUST-Botany Honey Company") - reused here
+    # rather than inventing a new one. All three Ubiquiti-family
+    # platforms can be the AP side of a PtMP network.
+    'AirOS v8': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
+    'AirFiber': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
+    'UISP': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
 }
 
 def _find_client_device_type(nb_api: pynetbox.api, manufacturer_slug: str, reported_model: str | None):
-    """Fuzzy-match a peer's reported model string to the closest
-    existing NetBox device type for a given manufacturer - the longest
-    registered model name that's a prefix of what the peer reported
-    (e.g. a peer reporting "TNA-303L-65" matches an existing "TNA-303"
-    type, since no more specific "TNA-303L" type is registered).
+    """Fuzzy-match a peer's reported model string to a NetBox device
+    type for a given manufacturer.
 
-    Returns None if there's no reported model at all, or no prefix
-    match - never guesses a device type with zero evidence.
+    Matches in *either* direction - a peer can report a more specific
+    model than any registered type (Tachyon: "TNA-303L-65" matches the
+    registered "TNA-303", since no more specific "TNA-303L" type
+    exists), or a less specific one (Ubiquiti: peers only ever report a
+    base model like "Rocket Prism 5AC", which is itself a prefix of the
+    registered "Rocket Prism 5AC Gen2" - confirmed live on both
+    platforms, in opposite directions).
+
+    Only trusted when it resolves to *exactly one* candidate - confirmed
+    live that the less-specific direction is often genuinely ambiguous
+    (a peer reporting "PowerBeam 5AC" or "NanoBeam 5AC" matches several
+    different registered variants at once: 300/500/Gen2, or 19/Gen2).
+    Returns None (never guesses among ambiguous candidates, and never
+    guesses at all with no reported model) rather than picking one
+    arbitrarily.
     """
     if not reported_model:
         return None
 
     candidates = [
         device_type for device_type in nb_api.dcim.device_types.filter(manufacturer=manufacturer_slug)
-        if reported_model.startswith(device_type.model)
+        if reported_model.startswith(device_type.model) or device_type.model.startswith(reported_model)
     ]
-    if not candidates:
+    if len(candidates) != 1:
         return None
 
-    return max(candidates, key=lambda device_type: len(device_type.model))
+    return candidates[0]
 
 def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.base.WirelessPeer):
     """Find or create a placeholder Device (+ one wireless Interface
@@ -958,6 +976,9 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
     )
 
     for ip in peer.ip_addresses or []:
+        if any(ip.ip in network for network in utils.networks_to_ignore):
+            continue
+
         existing = list(nb_api.ipam.ip_addresses.filter(address=str(ip)))
         ip_record = drivers.base.IPAddress(address=ip, interface='wlan0', status='active', vrf=None)
         if existing:

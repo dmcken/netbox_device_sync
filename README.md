@@ -146,21 +146,33 @@ For the AP side of a point-to-multipoint `WirelessLAN` only (never a
 point-to-point `WirelessLink` - that peer is expected to already be a
 real, separately-managed device): a peer whose MAC doesn't resolve to
 any existing NetBox interface is, on a platform with an entry in
-sync.py's `_CLIENT_DEVICE_CONVENTIONS` (currently just `Tachyon`),
+sync.py's `_CLIENT_DEVICE_CONVENTIONS` (currently `Tachyon`, and all
+three Ubiquiti-family platforms - `AirOS v8`/`AirFiber`/`UISP`),
 auto-provisioned a placeholder client Device instead of just being
 logged as an unresolved peer:
 
 * Named `"<prefix><peer's reported name>"` - `"TACH-<name>"` for
-  Tachyon, where the "name" is whatever the peer itself reports (e.g.
-  `wireless.peers[].system_name` on a Tachyon radio - often a customer
-  name in this fleet's convention, but it's exactly what the peer
-  reports, not independently verified).
+  Tachyon (the name being e.g. `wireless.peers[].system_name` on a
+  Tachyon radio), `"CUST-<name>"` for Ubiquiti (reusing this fleet's
+  existing, if previously inconsistently-applied, manual customer-CPE
+  naming convention, e.g. `CUST-Botany Honey Company`) - either way
+  it's exactly what the peer itself reports, not independently
+  verified.
 * Device type is fuzzy-matched from the peer's own reported hardware
-  model to the *longest* existing NetBox device type name that's a
-  prefix of it (e.g. a peer reporting `"TNA-303L-65"` matches an
-  existing `"TNA-303"` type, since no more specific `"TNA-303L"` type is
-  registered) - if nothing matches at all, the device isn't created and
-  a warning is logged instead, same as an unresolved peer normally gets.
+  model against existing NetBox device types for that platform's
+  manufacturer, in *either* direction - a peer can report a more
+  specific model than any registered type (Tachyon: `"TNA-303L-65"`
+  matches the registered `"TNA-303"`, since no more specific
+  `"TNA-303L"` type exists), or a less specific one (Ubiquiti: peers
+  only ever report a base model like `"Rocket Prism 5AC"`, itself a
+  prefix of the registered `"Rocket Prism 5AC Gen2"`). Only trusted when
+  it resolves to *exactly one* candidate - confirmed live that the
+  less-specific direction is often genuinely ambiguous (a peer
+  reporting `"PowerBeam 5AC"` or `"NanoBeam 5AC"` matches several
+  different registered variants - `5AC 300`/`5AC 500`/`5AC Gen2`, or
+  `5AC 19`/`5AC Gen2` - at once). No match, or more than one, and the
+  device isn't created - a warning is logged instead, same as an
+  unresolved peer normally gets.
 * Role `CPE - Dish`, site matching the AP's own site, status `active`.
 * **`platform` is deliberately left unset** (matching every existing
   manually-created customer placeholder in this fleet already) - so
@@ -168,6 +180,7 @@ logged as an unresolved peer:
   credentials that aren't ours to use.
 * Gets one `wlan0` interface holding the peer's MAC and IP addresses
   (recorded as host routes - `/32`/`/128` - since a peer only ever
-  reports its own bare address, never the subnet it's part of) - then
-  treated exactly like a normally-resolved peer from there on
-  (associated with the `WirelessLAN`, etc).
+  reports its own bare address, never the subnet it's part of; the same
+  link-local/loopback ranges ignored everywhere else in this tool are
+  skipped here too) - then treated exactly like a normally-resolved
+  peer from there on (associated with the `WirelessLAN`, etc).

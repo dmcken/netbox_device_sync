@@ -261,9 +261,30 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
             mac = sta.get('mac')
             if not mac:
                 continue
+
+            remote = sta.get('remote', {})
+            peer_ips = []
+            for raw, prefixlen in (
+                *((addr, 32) for addr in remote.get('ipaddr', [])),
+                *((addr, 128) for addr in remote.get('ip6addr', [])),
+            ):
+                try:
+                    peer_ips.append(ipaddress.ip_interface(f"{raw}/{prefixlen}"))
+                except ValueError:
+                    logger.error(f"Unable to parse peer address on '{mac}': {raw}")
+
             peers.append(drivers.base.WirelessPeer(
                 mac=mac,
-                hostname=sta.get('remote', {}).get('hostname'),
+                hostname=remote.get('hostname'),
+                # e.g. "Rocket Prism 5AC" / "PowerBeam 5AC" - confirmed
+                # live. Used to fuzzy-match a NetBox device type when
+                # auto-provisioning a placeholder for a peer with no
+                # existing NetBox interface.
+                model=remote.get('platform'),
+                # No prefix reported for a peer's own address (unlike
+                # this device's own interfaces) - /32 and /128 record
+                # "this one address exists" without inventing a subnet.
+                ip_addresses=peer_ips or None,
             ))
 
         return [drivers.base.WirelessRadio(
