@@ -891,37 +891,69 @@ _CLIENT_DEVICE_CONVENTIONS = {
     'UISP': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
 }
 
+_MODEL_WHITESPACE_RE = re.compile(r'[\s-]+')
+
+def _normalize_model(model: str) -> str:
+    """Fold whitespace/hyphen variation and case out of a model string
+    for comparison purposes - confirmed live that a peer can report
+    "Wave-LR" for a device registered in NetBox as "Wave LR", otherwise
+    an exact prefix match on either side.
+    """
+    return _MODEL_WHITESPACE_RE.sub(' ', model).strip().lower()
+
 def _find_client_device_type(nb_api: pynetbox.api, manufacturer_slug: str, reported_model: str | None):
     """Fuzzy-match a peer's reported model string to a NetBox device
     type for a given manufacturer.
 
-    Matches in *either* direction - a peer can report a more specific
-    model than any registered type (Tachyon: "TNA-303L-65" matches the
-    registered "TNA-303", since no more specific "TNA-303L" type
-    exists), or a less specific one (Ubiquiti: peers only ever report a
-    base model like "Rocket Prism 5AC", which is itself a prefix of the
-    registered "Rocket Prism 5AC Gen2" - confirmed live on both
-    platforms, in opposite directions).
+    Matches in *either* direction (after normalizing whitespace/hyphens
+    and case - see _normalize_model()) - a peer can report a more
+    specific model than any registered type (Tachyon: "TNA-303L-65"
+    matches the registered "TNA-303", since no more specific "TNA-303L"
+    type exists), or a less specific one (Ubiquiti: peers only ever
+    report a base model like "Rocket Prism 5AC", which is itself a
+    prefix of the registered "Rocket Prism 5AC Gen2" - confirmed live on
+    both platforms, in opposite directions).
 
     Only trusted when it resolves to *exactly one* candidate - confirmed
     live that the less-specific direction is often genuinely ambiguous
     (a peer reporting "PowerBeam 5AC" or "NanoBeam 5AC" matches several
     different registered variants at once: 300/500/Gen2, or 19/Gen2).
-    Returns None (never guesses among ambiguous candidates, and never
-    guesses at all with no reported model) rather than picking one
-    arbitrarily.
+    Logs a warning either way when there's no single confident match -
+    distinguishing "nothing registered for this model at all" (a
+    NetBox device type needs adding) from "matches N different
+    variants" (nothing to add - there's no way to tell which from the
+    peer data alone) - so it's clear which peers, if any, are worth
+    creating a more specific device type for. Never guesses among
+    ambiguous candidates, and never guesses at all with no reported
+    model, rather than picking one arbitrarily.
     """
     if not reported_model:
         return None
 
-    candidates = [
-        device_type for device_type in nb_api.dcim.device_types.filter(manufacturer=manufacturer_slug)
-        if reported_model.startswith(device_type.model) or device_type.model.startswith(reported_model)
-    ]
-    if len(candidates) != 1:
-        return None
+    normalized_reported = _normalize_model(reported_model)
+    candidates = []
+    for device_type in nb_api.dcim.device_types.filter(manufacturer=manufacturer_slug):
+        normalized_type = _normalize_model(device_type.model)
+        if normalized_reported.startswith(normalized_type) or normalized_type.startswith(normalized_reported):
+            candidates.append(device_type)
 
-    return candidates[0]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if not candidates:
+        logger.warning(
+            f"No NetBox device type for manufacturer '{manufacturer_slug}' matches "
+            f"reported model '{reported_model}' at all - add one if you want peers "
+            f"reporting this model to auto-provision"
+        )
+    else:
+        logger.warning(
+            f"Reported model '{reported_model}' matches {len(candidates)} existing "
+            f"device types ambiguously ({', '.join(c.model for c in candidates)}) - "
+            "can't tell which, skipping"
+        )
+
+    return None
 
 def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.base.WirelessPeer):
     """Find or create a placeholder Device (+ one wireless Interface
@@ -940,12 +972,23 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
     NetBox device type its reported model fuzzy-matches, or the AP
     itself has no site to place it at.
     """
-    if not peer.hostname:
+    # Confirmed live: NetBox silently trims leading/trailing whitespace
+    # from a device's name on save (a peer's own hostname is free text,
+    # and some report one with a trailing space), but a later lookup
+    # using the untrimmed string doesn't match the trimmed stored name -
+    # not a "not found" (which this function already handles by
+    # creating one), but a hard validation error on the interface
+    # lookup below, which previously aborted the rest of this AP's
+    # sync entirely. Stripping once up front keeps the name this
+    # function creates/looks up consistent with what NetBox actually
+    # stores.
+    hostname = peer.hostname.strip() if peer.hostname else None
+    if not hostname:
         return None
 
     if ap_device_nb.site is None:
         logger.warning(
-            f"Can't auto-create a client device for peer '{peer.hostname}' "
+            f"Can't auto-create a client device for peer '{hostname}' "
             f"({peer.mac}) - '{ap_device_nb.name}' has no site of its own"
         )
         return None
@@ -954,13 +997,13 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
     device_type = _find_client_device_type(nb_api, convention['manufacturer_slug'], peer.model)
     if device_type is None:
         logger.warning(
-            f"Can't auto-create a client device for peer '{peer.hostname}' "
+            f"Can't auto-create a client device for peer '{hostname}' "
             f"({peer.mac}) - no NetBox device type matches its reported "
             f"model '{peer.model}'"
         )
         return None
 
-    device_name = f"{convention['name_prefix']}{peer.hostname}"
+    device_name = f"{convention['name_prefix']}{hostname}"
 
     device_nb = nb_api.dcim.devices.get(name=device_name)
     if device_nb is None:
