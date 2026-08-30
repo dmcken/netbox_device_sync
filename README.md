@@ -134,3 +134,40 @@ actually in.
   pair already confirmed live over the air), but still an assumption
   about which physical port that implies, so it has its own separate
   gate rather than sharing `ASSUME_SUBNET_LINKS_30_31`.
+
+#### Client device auto-provisioning (`ASSUME_CLIENT_DEVICES`)
+
+Unlike everything above, which only ever links or fills in fields on
+Devices that already exist, this one creates brand-new Device/Interface
+records - so it's off by default even more deliberately than the two
+subnet-inference rules.
+
+For the AP side of a point-to-multipoint `WirelessLAN` only (never a
+point-to-point `WirelessLink` - that peer is expected to already be a
+real, separately-managed device): a peer whose MAC doesn't resolve to
+any existing NetBox interface is, on a platform with an entry in
+sync.py's `_CLIENT_DEVICE_CONVENTIONS` (currently just `Tachyon`),
+auto-provisioned a placeholder client Device instead of just being
+logged as an unresolved peer:
+
+* Named `"<prefix><peer's reported name>"` - `"TACH-<name>"` for
+  Tachyon, where the "name" is whatever the peer itself reports (e.g.
+  `wireless.peers[].system_name` on a Tachyon radio - often a customer
+  name in this fleet's convention, but it's exactly what the peer
+  reports, not independently verified).
+* Device type is fuzzy-matched from the peer's own reported hardware
+  model to the *longest* existing NetBox device type name that's a
+  prefix of it (e.g. a peer reporting `"TNA-303L-65"` matches an
+  existing `"TNA-303"` type, since no more specific `"TNA-303L"` type is
+  registered) - if nothing matches at all, the device isn't created and
+  a warning is logged instead, same as an unresolved peer normally gets.
+* Role `CPE - Dish`, site matching the AP's own site, status `active`.
+* **`platform` is deliberately left unset** (matching every existing
+  manually-created customer placeholder in this fleet already) - so
+  this tool's own per-device sync loop never tries to poll it with
+  credentials that aren't ours to use.
+* Gets one `wlan0` interface holding the peer's MAC and IP addresses
+  (recorded as host routes - `/32`/`/128` - since a peer only ever
+  reports its own bare address, never the subnet it's part of) - then
+  treated exactly like a normally-resolved peer from there on
+  (associated with the `WirelessLAN`, etc).

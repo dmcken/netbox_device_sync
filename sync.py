@@ -857,14 +857,131 @@ def _sync_wireless_link(
         link.save()
         logger.info(f"Updated WirelessLink {link.id}: {list(changed.keys())}")
 
+# Maps an AP's own NetBox platform to the naming/manufacturer convention
+# used when auto-provisioning a placeholder Device for one of its PtMP
+# peers that isn't already tracked in NetBox at all - e.g. a customer's
+# CPE this fleet only ever sees over the air, never logs into directly.
+# Deliberately narrow (opt-in per platform, no fallback convention)
+# since the naming scheme is a policy choice tied to which product
+# family the AP itself belongs to - only ever consulted for a PtMP
+# AP's peers (see _sync_wireless_lan()), never a PtP link's, since a
+# PtP peer is expected to already be a real, separately-managed device.
+_CLIENT_DEVICE_CONVENTIONS = {
+    'Tachyon': {'name_prefix': 'TACH-', 'manufacturer_slug': 'tachyon-networks'},
+}
+
+def _find_client_device_type(nb_api: pynetbox.api, manufacturer_slug: str, reported_model: str | None):
+    """Fuzzy-match a peer's reported model string to the closest
+    existing NetBox device type for a given manufacturer - the longest
+    registered model name that's a prefix of what the peer reported
+    (e.g. a peer reporting "TNA-303L-65" matches an existing "TNA-303"
+    type, since no more specific "TNA-303L" type is registered).
+
+    Returns None if there's no reported model at all, or no prefix
+    match - never guesses a device type with zero evidence.
+    """
+    if not reported_model:
+        return None
+
+    candidates = [
+        device_type for device_type in nb_api.dcim.device_types.filter(manufacturer=manufacturer_slug)
+        if reported_model.startswith(device_type.model)
+    ]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda device_type: len(device_type.model))
+
+def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.base.WirelessPeer):
+    """Find or create a placeholder Device (+ one wireless Interface
+    carrying the peer's MAC and IP addresses) for a PtMP peer that
+    isn't already tracked in NetBox at all.
+
+    Only ever called for a platform with an entry in
+    _CLIENT_DEVICE_CONVENTIONS. Deliberately leaves `platform` unset on
+    the new device (matching every existing manually-created customer
+    placeholder in this fleet) so sync.py's own per-device loop never
+    tries to poll it with credentials that aren't ours to use.
+
+    Returns the new/existing Interface (ready to be treated exactly
+    like a normally-resolved peer from here on), or None if a device
+    can't be responsibly created - no hostname to name it after, no
+    NetBox device type its reported model fuzzy-matches, or the AP
+    itself has no site to place it at.
+    """
+    if not peer.hostname:
+        return None
+
+    if ap_device_nb.site is None:
+        logger.warning(
+            f"Can't auto-create a client device for peer '{peer.hostname}' "
+            f"({peer.mac}) - '{ap_device_nb.name}' has no site of its own"
+        )
+        return None
+
+    convention = _CLIENT_DEVICE_CONVENTIONS[str(ap_device_nb.platform)]
+    device_type = _find_client_device_type(nb_api, convention['manufacturer_slug'], peer.model)
+    if device_type is None:
+        logger.warning(
+            f"Can't auto-create a client device for peer '{peer.hostname}' "
+            f"({peer.mac}) - no NetBox device type matches its reported "
+            f"model '{peer.model}'"
+        )
+        return None
+
+    device_name = f"{convention['name_prefix']}{peer.hostname}"
+
+    device_nb = nb_api.dcim.devices.get(name=device_name)
+    if device_nb is None:
+        role = nb_api.dcim.device_roles.get(slug='cpe-dish')
+        device_nb = nb_api.dcim.devices.create(
+            name=device_name,
+            device_type=device_type.id,
+            role=role.id,
+            site=ap_device_nb.site.id,
+            status='active',
+        )
+        logger.info(
+            f"Created client device '{device_name}' ({device_type.model}) at "
+            f"'{ap_device_nb.site.name}', seen as a peer of '{ap_device_nb.name}'"
+        )
+
+    peer_interface = nb_api.dcim.interfaces.get(device=device_name, name='wlan0')
+    if peer_interface is None:
+        peer_interface = nb_api.dcim.interfaces.create(
+            device=device_nb.id, name='wlan0', type='other-wireless',
+        )
+
+    set_interface_macs(
+        drivers.base.Interface(name='wlan0', mac_address=[peer.mac], type='other-wireless'),
+        peer_interface, nb_api,
+    )
+
+    for ip in peer.ip_addresses or []:
+        existing = list(nb_api.ipam.ip_addresses.filter(address=str(ip)))
+        ip_record = drivers.base.IPAddress(address=ip, interface='wlan0', status='active', vrf=None)
+        if existing:
+            if existing[0].assigned_object_type is None:
+                update_ip_address(ip_record, existing, {'wlan0': peer_interface})
+        else:
+            create_ip_address(nb_api, ip_record, {'wlan0': peer_interface})
+
+    return peer_interface
+
 def _sync_wireless_lan(
     nb_api: pynetbox.api, device_nb, nb_interface, radio: drivers.base.WirelessRadio,
-    auth_type: str | None,
+    auth_type: str | None, assume_client_devices: bool = False,
 ) -> None:
     """Sync a point-to-multipoint network (a radio with more than one
     currently-linked peer) - find-or-create its WirelessLAN (keyed on
     ssid), associate this AP's own interface, and associate whichever
     peers resolve to a NetBox interface.
+
+    A peer that doesn't resolve to an existing interface is, when
+    assume_client_devices is set and this AP's platform has an entry in
+    _CLIENT_DEVICE_CONVENTIONS, auto-provisioned a placeholder client
+    Device instead of just being logged and skipped - see
+    _provision_client_device().
     """
     if not radio.ssid:
         logger.error(
@@ -898,6 +1015,10 @@ def _sync_wireless_lan(
 
     for peer in radio.peers:
         peer_interface = _find_interface_by_mac(nb_api, peer.mac)
+        if peer_interface is None and assume_client_devices \
+                and str(device_nb.platform) in _CLIENT_DEVICE_CONVENTIONS:
+            peer_interface = _provision_client_device(nb_api, device_nb, peer)
+
         if peer_interface is None:
             logger.warning(
                 f"Could not match PtMP peer '{peer.hostname}' ({peer.mac}) on "
@@ -918,7 +1039,10 @@ def _sync_wireless_lan(
             peer_interface.wireless_lans = [*existing_ids, wlan.id]
             peer_interface.save()
 
-def sync_wireless(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
+def sync_wireless(
+    nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase,
+    assume_client_devices: bool = False,
+) -> None:
     """Sync wireless frequency/channel data and PtP/PtMP connections.
 
     A radio with exactly one currently-linked peer is one end of a
@@ -934,6 +1058,11 @@ def sync_wireless(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.Dri
         nb_api (pynetbox.api): Netbox API connection.
         device_nb (_type_): The device from netbox's perspective.
         device_conn (drivers.base.DriverBase): _description_
+        assume_client_devices (bool): Auto-provision a placeholder
+            client Device for a PtMP peer with no matching NetBox
+            interface, on platforms with a _CLIENT_DEVICE_CONVENTIONS
+            entry - see _sync_wireless_lan(). Never applied to a PtP
+            link's peer.
     """
     for radio in device_conn.get_wireless_radios():
         nb_interface = nb_api.dcim.interfaces.get(device=device_nb.name, name=radio.interface)
@@ -970,7 +1099,9 @@ def sync_wireless(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.Dri
         if len(radio.peers) == 1:
             _sync_wireless_link(nb_api, device_nb, nb_interface, radio, auth_type)
         else:
-            _sync_wireless_lan(nb_api, device_nb, nb_interface, radio, auth_type)
+            _sync_wireless_lan(
+                nb_api, device_nb, nb_interface, radio, auth_type, assume_client_devices,
+            )
 
 def _is_physical_interface(nb_interface) -> bool:
     """True if this interface is a real, single cable-terminable port -
@@ -1384,6 +1515,9 @@ def main() -> None:
     }
 
     device_credentials = utils.parse_device_parameters()
+    assume_client_devices = os.environ.get(
+        'ASSUME_CLIENT_DEVICES', '',
+    ).strip().lower() in ('1', 'true', 'yes', 'on')
 
     # Fetch and process the devices from netbox.
     devices = nb_api.dcim.devices.all()
@@ -1438,7 +1572,7 @@ def main() -> None:
             sync_ips(nb_api, device_nb, device_conn)
             _ensure_primary_ip(nb_api, device_nb, device_ip)
             sync_site_gps(nb_api, device_nb, device_conn)
-            sync_wireless(nb_api, device_nb, device_conn)
+            sync_wireless(nb_api, device_nb, device_conn, assume_client_devices)
             # sync_neighbours(nb_api, device_nb, device_conn)
 
             # To Sync

@@ -272,13 +272,17 @@ class Tachyon(drivers.base.DriverBase):
         neither side gives them an explicit shared id and this hasn't
         been confirmed live against a unit with more than one VAP.
 
-        Peer parsing (peers[].mac/hostname below) is a best-effort
-        guess at the field names, NOT confirmed live - the one unit
-        available while writing this had zero connected peers
-        (peerCount: 0), so there was nothing real to check the shape
-        against. Defensive .get() throughout means a wrong guess just
-        yields fewer/no peers rather than a crash; revisit once a real
-        connected CPE is available.
+        Peer parsing confirmed live against a second TNA-303X with 4
+        real connected CPEs: a peer's human-readable label (e.g. a
+        customer name) is status.wireless.peers[].system_name, NOT
+        "hostname" as originally guessed when this was written against
+        a unit with zero connected peers - fixed once real data was
+        available. peers[].model (e.g. "TNA-303L-65") is the peer's own
+        reported hardware model, used elsewhere to fuzzy-match a NetBox
+        device type when auto-provisioning a placeholder for a peer
+        with no existing NetBox interface. ipv4/ipv6 are the peer's own
+        bare addresses (no prefix reported), recorded as host routes
+        (/32, /128) rather than guessing at a subnet.
         '''
         config_radios = self._fetch_config().get('wireless', {}).get('radios', {})
         if not config_radios:
@@ -297,7 +301,23 @@ class Tachyon(drivers.base.DriverBase):
             mac = peer.get('mac')
             if not mac:
                 continue
-            peers.append(drivers.base.WirelessPeer(mac=mac, hostname=peer.get('hostname')))
+
+            peer_ips = []
+            for key, prefixlen in (('ipv4', 32), ('ipv6', 128)):
+                raw = peer.get(key)
+                if not raw:
+                    continue
+                try:
+                    peer_ips.append(ipaddress.ip_interface(f"{raw}/{prefixlen}"))
+                except ValueError:
+                    logger.error(f"Unable to parse peer {key} on '{mac}': {raw}")
+
+            peers.append(drivers.base.WirelessPeer(
+                mac=mac,
+                hostname=peer.get('system_name'),
+                model=peer.get('model'),
+                ip_addresses=peer_ips or None,
+            ))
 
         radios = []
         for radio_name, radio_config in config_radios.items():

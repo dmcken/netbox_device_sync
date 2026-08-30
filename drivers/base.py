@@ -109,9 +109,21 @@ class GPSCoordinate:
 @dataclasses.dataclass
 class WirelessPeer:
     '''One peer currently linked to a WirelessRadio - the far end of a
-    point-to-point link, or one client of a point-to-multipoint AP.'''
+    point-to-point link, or one client of a point-to-multipoint AP.
+
+    model: the peer's own reported hardware model string, if any - used
+    to fuzzy-match a NetBox device type when auto-provisioning a
+    placeholder Device for a peer with no matching NetBox interface
+    (see sync.py's _find_client_device_type()).
+    ip_addresses: the peer's own live IP address(es), if reported -
+    typically with no known prefix length (a peer only ever reports its
+    own bare address, not the subnet it's part of), so these are
+    host addresses (/32, /128) rather than a guessed subnet.
+    '''
     mac: str
     hostname: str = None
+    model: str = None
+    ip_addresses: list[ipaddress.IPv4Interface | ipaddress.IPv6Interface] = None
 
 @dataclasses.dataclass
 class WirelessRadio:
