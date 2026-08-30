@@ -50,6 +50,13 @@ _WIRELESS_INTERFACE_TYPES = {
 # UXG"). See sync_cable_descriptions().
 _CABLE_DESC_RE = re.compile(r'^([^\[\]]+?)\s*\[([^\[\]]+)\]')
 
+# NetBox Interface.type values that aren't a real, single cable-terminable
+# port - used by the /30-/31 and /29 subnet-inference rules below to avoid
+# matching a bridge/LAG aggregate or loopback-style virtual address instead
+# of an actual physical port. Wireless PHY types are excluded too, since
+# those are radios, not wired ports.
+_NON_PHYSICAL_INTERFACE_TYPES = {'virtual', 'bridge', 'lag'} | _WIRELESS_INTERFACE_TYPES
+
 logger = logging.getLogger(__name__)
 
 def interface_create(nb: pynetbox.api, device_nb, cleaned_params, curr_dev_interface) -> None:
@@ -922,6 +929,80 @@ def sync_wireless(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.Dri
         else:
             _sync_wireless_lan(nb_api, device_nb, nb_interface, radio, auth_type)
 
+def _is_physical_interface(nb_interface) -> bool:
+    """True if this interface is a real, single cable-terminable port -
+    not a bridge/LAG/virtual aggregate or a wireless radio, and not a
+    software tunnel either.
+
+    NetBox's type vocabulary has no dedicated "tunnel" category - a
+    software interface like an IPIP/GRE endpoint just gets left as the
+    generic 'other', the exact same value plenty of real, unclassified
+    physical ports use (confirmed live: an actual physical SFP+ port and
+    a device's IPIP tunnel interface were both typed 'other'). The
+    presence of a MAC address is what actually distinguishes them - a
+    real port has one the device itself reported (see
+    set_interface_macs()); a tunnel never does, since it isn't real
+    hardware. So type only rules out the unambiguous non-physical
+    categories; a MAC address is what confirms the rest.
+    """
+    if not nb_interface.type or nb_interface.type.value in _NON_PHYSICAL_INTERFACE_TYPES:
+        return False
+    return bool(nb_interface.primary_mac_address)
+
+def _resolve_physical_port(nb_api: pynetbox.api, nb_interface):
+    """Resolve an interface down to the one real physical port it's
+    actually reachable through.
+
+    Returns the interface itself if it's already physical. If it's a
+    bridge, returns its sole non-wireless physical member - but only if
+    there's exactly one; confirmed live that a router's bridge can
+    aggregate several physical uplink ports at once (a switch fabric,
+    not a single radio's wired uplink), and there's no data available
+    here (no LLDP, just interface/IP/bridge structure) to know which one
+    a given cable is actually in, so that's left alone rather than
+    guessed. If it's a virtual/VLAN sub-interface, applies the same
+    resolution to its own parent instead (confirmed live: a router's
+    /29 IP can sit on a VLAN interface on top of a bridge, not directly
+    on a physical port).
+    """
+    if _is_physical_interface(nb_interface):
+        return nb_interface
+
+    if nb_interface.type and nb_interface.type.value == 'bridge':
+        members = [
+            member for member in nb_api.dcim.interfaces.filter(
+                device_id=nb_interface.device.id, bridge_id=nb_interface.id,
+            )
+            if _is_physical_interface(member)
+        ]
+        return members[0] if len(members) == 1 else None
+
+    if nb_interface.parent:
+        return _resolve_physical_port(
+            nb_api, nb_api.dcim.interfaces.get(id=nb_interface.parent.id),
+        )
+
+    return None
+
+def _create_cable(nb_api: pynetbox.api, interface_a, interface_b, description: str) -> bool:
+    """Create a Cable connecting two interfaces. Returns whether it was
+    actually created - tolerates the other end's own pass (or a
+    different rule) having already cabled one of these interfaces
+    since this run started reading NetBox.
+    """
+    try:
+        nb_api.dcim.cables.create(
+            a_terminations=[{'object_type': 'dcim.interface', 'object_id': interface_a.id}],
+            b_terminations=[{'object_type': 'dcim.interface', 'object_id': interface_b.id}],
+            status='connected',
+        )
+    except pynetbox.core.query.RequestError as exc:
+        logger.debug(f"Could not create cable {description}: {exc}")
+        return False
+
+    logger.info(f"Created cable {description}")
+    return True
+
 def sync_cable_descriptions(nb_api: pynetbox.api) -> None:
     """Create Cables from the "<Device> [<Port>]" manual cabling
     convention already used fleet-wide in interface descriptions - e.g.
@@ -973,28 +1054,167 @@ def sync_cable_descriptions(nb_api: pynetbox.api) -> None:
         if remote_interface.id == interface.id or remote_interface.cable:
             continue
 
+        # Most likely failure mode is a race with the other end's own pass
+        # through this same loop (both sides commonly carry matching
+        # descriptions) - our in-memory copy just hadn't seen it yet.
+        _create_cable(
+            nb_api, interface, remote_interface,
+            f"'{interface.device.name}'/{interface.name} <-> "
+            f"'{remote_device_name}'/{remote_port_name}",
+        )
+
+def sync_subnet_links_30_31(nb_api: pynetbox.api) -> None:
+    """Create Cables between interfaces whose IPs share a /30 or /31 -
+    the standard point-to-point routed-link convention (exactly 2 usable
+    host addresses), so two interfaces landing in the same one of these
+    small subnets can safely be assumed to be the two ends of one cable.
+
+    Gated behind ASSUME_SUBNET_LINKS_30_31 - unlike the wireless-derived
+    /29 rule below, this has no corroborating live evidence at all, just
+    the subnet size itself, so it's opt-in.
+
+    Not driven by any live device - pure NetBox IP data - so, like
+    sync_cable_descriptions(), this runs once per invocation rather than
+    per-device.
+    """
+    by_network: dict[ipaddress.IPv4Network | ipaddress.IPv6Network, list] = {}
+    for ip in nb_api.ipam.ip_addresses.all():
+        if ip.assigned_object_type != 'dcim.interface' or not ip.address:
+            continue
         try:
-            nb_api.dcim.cables.create(
-                a_terminations=[{'object_type': 'dcim.interface', 'object_id': interface.id}],
-                b_terminations=[
-                    {'object_type': 'dcim.interface', 'object_id': remote_interface.id}
-                ],
-                status='connected',
-            )
-        except pynetbox.core.query.RequestError as exc:
-            # Most likely the other end's own pass through this same loop
-            # already cabled it (both sides commonly carry matching
-            # descriptions) - our in-memory copy just hadn't seen it yet.
-            logger.debug(
-                f"Could not create cable '{interface.device.name}'/{interface.name} <-> "
-                f"'{remote_device_name}'/{remote_port_name}: {exc}"
-            )
+            iface = ipaddress.ip_interface(ip.address)
+        except ValueError:
+            continue
+        if iface.network.prefixlen not in (30, 31):
+            continue
+        by_network.setdefault(iface.network, []).append(ip)
+
+    for network, ips in by_network.items():
+        if len(ips) != 2:
             continue
 
-        logger.info(
-            f"Created cable '{interface.device.name}'/{interface.name} <-> "
-            f"'{remote_device_name}'/{remote_port_name}"
+        ip_a, ip_b = ips
+        if ip_a.assigned_object.device.id == ip_b.assigned_object.device.id:
+            continue
+
+        interface_a = nb_api.dcim.interfaces.get(id=ip_a.assigned_object_id)
+        interface_b = nb_api.dcim.interfaces.get(id=ip_b.assigned_object_id)
+        if not (_is_physical_interface(interface_a) and _is_physical_interface(interface_b)):
+            continue
+        if interface_a.cable or interface_b.cable:
+            continue
+
+        _create_cable(
+            nb_api, interface_a, interface_b,
+            f"'{interface_a.device.name}'/{interface_a.name} <-> "
+            f"'{interface_b.device.name}'/{interface_b.name} (shared {network})",
         )
+
+def _find_backhaul_ethernet_port(nb_api: pynetbox.api, device_id: int):
+    """Find a backhaul device's own /29 IP (the one shared with its
+    wireless peer's site, per the fleet's backhaul-interconnect
+    convention) and the physical port that address is actually reachable
+    through - either the IP-holding interface itself (if it's already a
+    physical port), or, if the IP sits on a bridge, that bridge's one
+    non-wireless physical member (the radio's own wired uplink, e.g.
+    eth0, bridged together with the radio interface itself on
+    AirOS/AirFiber/UISP backhaul gear).
+
+    Returns (ip, physical_interface), or (None, None) if this device
+    isn't laid out with this convention at all (no /29 IP - e.g. a
+    customer CPE at the far end of an unrelated WirelessLink), has more
+    than one /29 IP, or the physical port can't be resolved
+    unambiguously (confirmed live: real fleet data has cases with zero
+    resolvable bridge members and cases with two - both left alone
+    rather than guessed).
+    """
+    ips = []
+    for ip in nb_api.ipam.ip_addresses.filter(device_id=device_id):
+        try:
+            if ipaddress.ip_interface(ip.address).network.prefixlen == 29:
+                ips.append(ip)
+        except ValueError:
+            continue
+    if len(ips) != 1:
+        return None, None
+
+    ip = ips[0]
+    ip_interface = nb_api.dcim.interfaces.get(id=ip.assigned_object_id)
+    physical = _resolve_physical_port(nb_api, ip_interface)
+    if physical is None:
+        return None, None
+
+    return ip, physical
+
+def sync_subnet_links_29(nb_api: pynetbox.api) -> None:
+    """Create Cables between each backhaul PtP wireless pair's own
+    ethernet uplink port and the router port on their own side of the
+    shared /29 block - the fleet's backhaul-interconnect IP layout
+    convention: a /29 holds exactly the two wireless radios' bridge IPs
+    (already linked to each other via sync_wireless()'s WirelessLink)
+    plus the two routers' physical ports they each wire into, laid out
+    so each side's router IP and radio IP are numerically closer to each
+    other than to the far side's - sorting both pairs and matching them
+    up in the same order recovers "same side" without hardcoding which
+    octets belong to which end.
+
+    Only ever considers physical (non-virtual/bridge/lag/wireless)
+    interfaces on the router side, and only devices already confirmed as
+    a real PtP wireless pair via an existing WirelessLink - this never
+    guesses at a subnet in isolation the way sync_subnet_links_30_31()
+    does, so unlike that rule this isn't gated behind
+    ASSUME_SUBNET_LINKS_30_31; it has its own gate,
+    ASSUME_SUBNET_LINKS_29, since it's still an assumption about which
+    physical port a live-observed wireless link's IP block implies, just
+    a much better-evidenced one.
+    """
+    for link in nb_api.wireless.wireless_links.all():
+        interface_a = nb_api.dcim.interfaces.get(id=link.interface_a.id)
+        interface_b = nb_api.dcim.interfaces.get(id=link.interface_b.id)
+        if interface_a.device.id == interface_b.device.id:
+            continue
+
+        ip_a, eth_a = _find_backhaul_ethernet_port(nb_api, interface_a.device.id)
+        ip_b, eth_b = _find_backhaul_ethernet_port(nb_api, interface_b.device.id)
+        if ip_a is None or ip_b is None:
+            continue
+
+        network_a = ipaddress.ip_interface(ip_a.address).network
+        network_b = ipaddress.ip_interface(ip_b.address).network
+        if network_a != network_b:
+            continue
+
+        router_candidates = []
+        for ip in nb_api.ipam.ip_addresses.filter(parent=str(network_a)):
+            if ip.id in (ip_a.id, ip_b.id):
+                continue
+            router_interface = nb_api.dcim.interfaces.get(id=ip.assigned_object_id)
+            if router_interface.device.id in (interface_a.device.id, interface_b.device.id):
+                continue
+            physical = _resolve_physical_port(nb_api, router_interface)
+            if physical is not None:
+                router_candidates.append((ip, physical))
+
+        if len(router_candidates) != 2:
+            continue
+
+        wireless_side = sorted(
+            [(ip_a, eth_a), (ip_b, eth_b)],
+            key=lambda pair: int(ipaddress.ip_interface(pair[0].address).ip),
+        )
+        router_side = sorted(
+            router_candidates,
+            key=lambda pair: int(ipaddress.ip_interface(pair[0].address).ip),
+        )
+
+        for (_, backhaul_eth), (_, router_eth) in zip(wireless_side, router_side):
+            if backhaul_eth.cable or router_eth.cable:
+                continue
+            _create_cable(
+                nb_api, backhaul_eth, router_eth,
+                f"'{backhaul_eth.device.name}'/{backhaul_eth.name} <-> "
+                f"'{router_eth.device.name}'/{router_eth.name} (shared {network_a})",
+            )
 
 def sync_neighbours(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
     """Sync neighbour data.
@@ -1207,6 +1427,13 @@ def main() -> None:
     # Not driven by any live device - runs once against NetBox's existing
     # interface descriptions, not per-device like the sync above.
     sync_cable_descriptions(nb_api)
+
+    # Same "runs once, NetBox data only" shape - see each function's own
+    # docstring for why they have separate gates.
+    if os.environ.get('ASSUME_SUBNET_LINKS_30_31', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        sync_subnet_links_30_31(nb_api)
+    if os.environ.get('ASSUME_SUBNET_LINKS_29', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        sync_subnet_links_29(nb_api)
 
     logger.info("Done")
 
