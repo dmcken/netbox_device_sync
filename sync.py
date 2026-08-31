@@ -881,14 +881,20 @@ def _sync_wireless_link(
 # PtP peer is expected to already be a real, separately-managed device.
 _CLIENT_DEVICE_CONVENTIONS = {
     'Tachyon': {'name_prefix': 'TACH-', 'manufacturer_slug': 'tachyon-networks'},
-    # "CUST-" already an existing (if inconsistently-applied) naming
-    # convention for manually-created Ubiquiti customer CPE placeholders
-    # in this fleet (e.g. "CUST-Botany Honey Company") - reused here
-    # rather than inventing a new one. All three Ubiquiti-family
-    # platforms can be the AP side of a PtMP network.
-    'AirOS v8': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
-    'AirFiber': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
-    'UISP': {'name_prefix': 'CUST-', 'manufacturer_slug': 'ubiquiti'},
+    # Originally reused this fleet's pre-existing "CUST-" convention for
+    # manually-created Ubiquiti customer CPE placeholders (e.g.
+    # "CUST-Botany Honey Company") - switched to a distinct prefix after
+    # that turned out to be a real problem: a name-prefix-scoped cleanup
+    # script has no way to tell an auto-created placeholder apart from a
+    # real, manually-managed "CUST-" device sharing the same prefix (a
+    # live one, "CUST-PSC_MainPump", was briefly modified by mistake
+    # this way). "platform is None" + "role is CPE - Dish" still reliably
+    # identifies an auto-created placeholder regardless of name, but a
+    # distinct prefix means that's not the *only* way to tell. All three
+    # Ubiquiti-family platforms can be the AP side of a PtMP network.
+    'AirOS v8': {'name_prefix': 'UBNT-', 'manufacturer_slug': 'ubiquiti'},
+    'AirFiber': {'name_prefix': 'UBNT-', 'manufacturer_slug': 'ubiquiti'},
+    'UISP': {'name_prefix': 'UBNT-', 'manufacturer_slug': 'ubiquiti'},
 }
 
 _MODEL_WHITESPACE_RE = re.compile(r'[\s-]+')

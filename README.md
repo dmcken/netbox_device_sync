@@ -153,11 +153,15 @@ logged as an unresolved peer:
 
 * Named `"<prefix><peer's reported name>"` - `"TACH-<name>"` for
   Tachyon (the name being e.g. `wireless.peers[].system_name` on a
-  Tachyon radio), `"CUST-<name>"` for Ubiquiti (reusing this fleet's
-  existing, if previously inconsistently-applied, manual customer-CPE
-  naming convention, e.g. `CUST-Botany Honey Company`) - either way
-  it's exactly what the peer itself reports, not independently
-  verified.
+  Tachyon radio), `"UBNT-<name>"` for Ubiquiti - either way it's
+  exactly what the peer itself reports, not independently verified.
+  Deliberately its own prefix, distinct from this fleet's pre-existing
+  manual `CUST-<name>` customer-CPE convention (e.g. `CUST-Botany Honey
+  Company`) - a real, manually-managed `CUST-` device was briefly
+  modified by mistake by a cleanup script that scoped by name prefix
+  instead of by `platform is None` + `role is CPE - Dish`, which is
+  what actually, reliably identifies an auto-created placeholder. A
+  distinct prefix means that's no longer the only way to tell.
 * Device type is fuzzy-matched from the peer's own reported hardware
   model against existing NetBox device types for that platform's
   manufacturer, in *either* direction - a peer can report a more
