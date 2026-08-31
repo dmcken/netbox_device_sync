@@ -1031,17 +1031,44 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
         peer_interface, nb_api,
     )
 
+    # The peer's own reported address is its overall management IP, not
+    # something specific to the radio - same "bridge carries the IP,
+    # radio/ethernet members carry MACs" split already established
+    # everywhere else in this project (Tachyon's br-wan, AirOS's br0).
+    # Confirmed live that every device type used here (LiteBeam/
+    # PowerBeam/NanoStation/Rocket/Wave/TNA-303) already defines a
+    # bridge interface in its own NetBox template, so prefer that when
+    # one exists; fall back to the radio interface itself only if it
+    # somehow doesn't.
+    ip_interface = next(
+        (i for i in nb_api.dcim.interfaces.filter(device=device_name) if i.type.value == 'bridge'),
+        peer_interface,
+    )
+
     for ip in peer.ip_addresses or []:
         if any(ip.ip in network for network in utils.networks_to_ignore):
             continue
 
         existing = list(nb_api.ipam.ip_addresses.filter(address=str(ip)))
-        ip_record = drivers.base.IPAddress(address=ip, interface='wlan0', status='active', vrf=None)
+        ip_record = drivers.base.IPAddress(
+            address=ip, interface=ip_interface.name, status='active', vrf=None,
+        )
         if existing:
-            if existing[0].assigned_object_type is None:
-                update_ip_address(ip_record, existing, {'wlan0': peer_interface})
+            ip_nb = existing[0]
+            if ip_nb.assigned_object_type is None:
+                update_ip_address(ip_record, existing, {ip_interface.name: ip_interface})
         else:
-            create_ip_address(nb_api, ip_record, {'wlan0': peer_interface})
+            create_ip_address(nb_api, ip_record, {ip_interface.name: ip_interface})
+            ip_nb = next(iter(nb_api.ipam.ip_addresses.filter(address=str(ip))), None)
+
+        # This is the only IP a peer ever reports for itself, so it's
+        # the obvious primary - but only filled in if not already set,
+        # same "device is authoritative for fresh data, never clobbers
+        # something already there" rule as everything else here.
+        primary_field = 'primary_ip6' if ip.ip.version == 6 else 'primary_ip4'
+        if ip_nb is not None and getattr(device_nb, primary_field) is None:
+            setattr(device_nb, primary_field, ip_nb.id)
+            device_nb.save()
 
     return peer_interface
 
