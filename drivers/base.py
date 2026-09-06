@@ -148,6 +148,29 @@ class WirelessRadio:
     psk: str = None
     peers: list[WirelessPeer] = None
 
+@dataclasses.dataclass
+class OspfNeighbour:
+    '''One OSPF neighbour adjacency on this device's own interface -
+    used to auto-link two routers via a real, live routing adjacency,
+    not just inferred from IP layout (like the /30-/31 subnet-linking
+    rule).
+
+    neighbour_address is the neighbour's own IP on this specific link
+    (no prefix - OSPF neighbour tables don't report one), used to find
+    which of the neighbour's own interfaces to connect the cable to.
+    neighbour_router_id is the neighbour's OSPF router ID - this
+    fleet's convention is to use each router's own loopback address for
+    it, so it identifies which *device* the neighbour actually is,
+    independent of (and a safety cross-check against) whatever
+    interface neighbour_address happens to resolve to in NetBox.
+    state is the raw adjacency state (e.g. "Full", "ExStart", "2-Way")
+    - the caller decides which states are trustworthy enough to act on.
+    '''
+    interface: str
+    neighbour_router_id: ipaddress.IPv4Address | ipaddress.IPv6Address
+    neighbour_address: ipaddress.IPv4Address | ipaddress.IPv6Address | None
+    state: str = None
+
 # Factories
 class DriverFactory:
     """Base factory for all driver objects"""
@@ -334,5 +357,18 @@ class DriverBase(metaclass = abc.ABCMeta):
 
         Returns:
             list[WirelessRadio]: This device's wireless radios.
+        """
+        return []
+
+    def get_ospf_neighbours(self,) -> list[OspfNeighbour]:
+        """Get this device's own OSPF neighbour adjacencies - used to
+        auto-link two routers via a real, live routing adjacency rather
+        than just inferring one from IP layout.
+
+        Return a blank list if the driver doesn't implement this
+        function, or the device isn't running OSPF at all.
+
+        Returns:
+            list[OspfNeighbour]: This device's OSPF neighbours.
         """
         return []

@@ -135,6 +135,38 @@ actually in.
   about which physical port that implies, so it has its own separate
   gate rather than sharing `ASSUME_SUBNET_LINKS_30_31`.
 
+#### OSPF-inferred routed links (`ASSUME_OSPF_LINKS`)
+
+A third opt-in cabling rule, currently only implemented for RouterOS
+(`drivers/routeros.py`'s `get_ospf_neighbours()`, reading
+`routing/ospf/neighbor`) - real routing-protocol evidence of a direct
+link, rather than an inference from IP layout like the two rules above.
+
+* Only ever acts on a local interface with exactly one distinct
+  neighbour router ID currently in the `Full` adjacency state. A shared/
+  broadcast segment (e.g. a "trunk" bridge aggregating several physical
+  uplinks) can carry `Full` adjacencies to more than one neighbour at
+  once on the same local interface - a single `Cable` can't represent
+  that, so it's left alone entirely rather than guessed at.
+* This fleet's convention is for each router's OSPF router ID to be its
+  own loopback address. The neighbour's reported link address (its IP
+  on this specific link, used to resolve which NetBox interface/device
+  it is) and its router ID are cross-checked against each other -
+  confirmed live that these can actually disagree (an IP address
+  recorded in NetBox against the wrong device entirely). A mismatch is
+  logged as a **warning** (a real data-quality issue worth surfacing)
+  and skipped rather than trusting either value blindly.
+* A router ID or address that falls in a known shared/non-unique
+  convenience network (see `utils.networks_to_ignore` - e.g.
+  `172.16.255.255/32`, confirmed live to sit identically on a
+  `loopback1` interface across multiple independent routers) is skipped
+  silently rather than reaching the cross-check above, since it can
+  never uniquely identify a single neighbour device.
+* OSPF runs happily over a VLAN/bridge interface, but NetBox `Cable`s
+  can only terminate on a real physical port - both ends are resolved
+  up to their physical port the same way as the `/29` rule above (giving
+  up rather than guessing on an ambiguous multi-member bridge).
+
 #### Client device auto-provisioning (`ASSUME_CLIENT_DEVICES`)
 
 Unlike everything above, which only ever links or fills in fields on

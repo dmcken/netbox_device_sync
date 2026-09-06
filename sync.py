@@ -1213,6 +1213,118 @@ def sync_wireless(
                 nb_api, device_nb, nb_interface, radio, auth_type, assume_client_devices,
             )
 
+def sync_ospf_links(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBase) -> None:
+    """Cable a router's own interface to whatever's on the other end of
+    a live, Full-state OSPF adjacency - real routing-protocol evidence
+    of a direct link, not just inferred from IP layout (like the
+    /30-/31 subnet-linking rule).
+
+    Only ever acts on an interface with exactly one distinct neighbour
+    router ID in Full state - confirmed live that the same local
+    interface can carry OSPF adjacencies for more than one neighbour at
+    once (a shared/switched segment, not a simple point-to-point link -
+    e.g. a "trunk" bridge interface aggregating several physical
+    uplinks), which a single Cable object can't represent, so that
+    case is left alone entirely rather than guessed at.
+
+    Also requires the neighbour's own reported address (its IP on this
+    specific link) and its router ID (this fleet's convention: each
+    router's own loopback address) to resolve to the *same* NetBox
+    device - confirmed live that these can actually disagree (an IP
+    address recorded in NetBox against the wrong device entirely), in
+    which case this logs a warning and doesn't link anything rather
+    than trusting either one blindly.
+    """
+    def _is_ignored(addr) -> bool:
+        return addr is not None and any(addr in network for network in utils.networks_to_ignore)
+
+    neighbours_by_interface: dict[str, list[drivers.base.OspfNeighbour]] = {}
+    for neighbour in device_conn.get_ospf_neighbours():
+        if neighbour.state != 'Full':
+            continue
+        # A router-id sitting in a known shared/convenience network
+        # (e.g. 172.16.255.255/32's "loopback1" convention, confirmed
+        # live to sit identically on multiple independent routers) can
+        # never uniquely identify a single neighbour device - skip it
+        # here rather than let it reach the router-id cross-check
+        # below, which would otherwise misreport it as a data
+        # inconsistency. Deliberately NOT applying this same check to
+        # neighbour_address: FE80::/10 is also in networks_to_ignore
+        # (for the unrelated IP-sync use case), but a link-local
+        # address here is the normal, expected shape of an OSPFv3
+        # neighbour entry, not a data problem - it's already handled
+        # by preferring a non-link-local entry below.
+        if _is_ignored(neighbour.neighbour_router_id):
+            logger.debug(
+                f"Skipping OSPF neighbour on '{device_nb.name}'/{neighbour.interface} - "
+                f"router-id {neighbour.neighbour_router_id} is in a known shared/"
+                "convenience network"
+            )
+            continue
+        neighbours_by_interface.setdefault(neighbour.interface, []).append(neighbour)
+
+    for local_interface_name, neighbours in neighbours_by_interface.items():
+        if len({n.neighbour_router_id for n in neighbours}) != 1:
+            logger.debug(
+                f"Skipping OSPF link for '{device_nb.name}'/{local_interface_name} - "
+                "more than one distinct neighbour router ID seen (a shared/broadcast "
+                "segment, not a simple point-to-point link)"
+            )
+            continue
+
+        neighbour = next(
+            (n for n in neighbours if n.neighbour_address and not n.neighbour_address.is_link_local),
+            None,
+        )
+        if neighbour is None:
+            continue
+
+        local_interface = nb_api.dcim.interfaces.get(device=device_nb.name, name=local_interface_name)
+        if local_interface is None:
+            continue
+
+        address_matches = list(nb_api.ipam.ip_addresses.filter(address=str(neighbour.neighbour_address)))
+        if len(address_matches) != 1 or address_matches[0].assigned_object_type != 'dcim.interface':
+            continue
+        remote_interface = nb_api.dcim.interfaces.get(id=address_matches[0].assigned_object_id)
+
+        router_id_devices = {
+            match.assigned_object.device.id
+            for match in nb_api.ipam.ip_addresses.filter(address=str(neighbour.neighbour_router_id))
+            if match.assigned_object_type == 'dcim.interface'
+        }
+        if remote_interface.device.id not in router_id_devices:
+            logger.warning(
+                f"OSPF neighbour data inconsistency for '{device_nb.name}'/{local_interface_name}: "
+                f"address {neighbour.neighbour_address} resolves to "
+                f"'{remote_interface.device.name}'/{remote_interface.name}, but router ID "
+                f"{neighbour.neighbour_router_id} belongs to a different device - not linking"
+            )
+            continue
+
+        if remote_interface.device.id == local_interface.device.id:
+            continue
+
+        # OSPF runs happily over a VLAN/bridge interface, but NetBox
+        # Cables can only terminate on a real physical port - confirmed
+        # live: "Cables cannot be terminated to Virtual interfaces".
+        # Same resolution (and same "give up rather than guess" caution
+        # on an ambiguous bridge) as the /29 backhaul subnet-linking
+        # rule already uses.
+        local_physical = _resolve_physical_port(nb_api, local_interface)
+        remote_physical = _resolve_physical_port(nb_api, remote_interface)
+        if local_physical is None or remote_physical is None:
+            continue
+
+        if local_physical.cable or remote_physical.cable:
+            continue
+
+        _create_cable(
+            nb_api, local_physical, remote_physical,
+            f"'{device_nb.name}'/{local_physical.name} <-> "
+            f"'{remote_interface.device.name}'/{remote_physical.name} (OSPF adjacency)",
+        )
+
 def _is_physical_interface(nb_interface) -> bool:
     """True if this interface is a real, single cable-terminable port -
     not a bridge/LAG/virtual aggregate or a wireless radio, and not a
@@ -1628,6 +1740,9 @@ def main() -> None:
     assume_client_devices = os.environ.get(
         'ASSUME_CLIENT_DEVICES', '',
     ).strip().lower() in ('1', 'true', 'yes', 'on')
+    assume_ospf_links = os.environ.get(
+        'ASSUME_OSPF_LINKS', '',
+    ).strip().lower() in ('1', 'true', 'yes', 'on')
 
     # Fetch and process the devices from netbox.
     devices = nb_api.dcim.devices.all()
@@ -1683,6 +1798,8 @@ def main() -> None:
             _ensure_primary_ip(nb_api, device_nb, device_ip)
             sync_site_gps(nb_api, device_nb, device_conn)
             sync_wireless(nb_api, device_nb, device_conn, assume_client_devices)
+            if assume_ospf_links:
+                sync_ospf_links(nb_api, device_nb, device_conn)
             # sync_neighbours(nb_api, device_nb, device_conn)
 
             # To Sync

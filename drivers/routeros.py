@@ -306,3 +306,38 @@ class RouterOS(drivers.base.DriverBase):
             ))
 
         return res_neighbours
+
+    def get_ospf_neighbours(self) -> list[drivers.base.OspfNeighbour]:
+        """Get this device's OSPF neighbour adjacencies
+        (routing/ospf/neighbor) - confirmed live on a real CCR2004
+        (RouterOS v7.24.2): {interface, address, router-id, state,
+        ...} per neighbour, `address` a bare IP with no prefix (may be
+        an IPv6 link-local address rather than the neighbour's routed
+        IPv4/IPv6 address, e.g. when the adjacency itself is still
+        stuck in a non-"Full" state like "ExStart").
+
+        Returns:
+            list[drivers.base.OspfNeighbour]: This device's OSPF
+                neighbours, empty if OSPF isn't running at all.
+        """
+        neighbours = []
+        for entry in self._dev.path('routing', 'ospf', 'neighbor'):
+            try:
+                router_id = ipaddress.ip_address(entry['router-id'])
+            except (KeyError, ValueError):
+                logger.error(f"Unable to parse OSPF neighbour router-id: {entry}")
+                continue
+
+            try:
+                address = ipaddress.ip_address(entry['address'])
+            except (KeyError, ValueError):
+                address = None
+
+            neighbours.append(drivers.base.OspfNeighbour(
+                interface=entry['interface'],
+                neighbour_router_id=router_id,
+                neighbour_address=address,
+                state=entry.get('state'),
+            ))
+
+        return neighbours

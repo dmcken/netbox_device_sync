@@ -38,6 +38,13 @@ networks_to_ignore = [
     # bridge (br2) - not a real per-device address, so not something
     # NetBox's global IP uniqueness should ever be asked to track.
     ipaddress.ip_network('192.168.2.0/24'),
+    # Same "shared, non-unique convenience address" pattern as above -
+    # confirmed live that 172.16.255.255/32 sits identically on a
+    # "loopback1" interface across at least two independent RouterOS
+    # routers (FIB-IE1, SHP-IE1) - surfaced as an OSPF router-id
+    # collision by sync_ospf_links()'s cross-check before being added
+    # here.
+    ipaddress.ip_network('172.16.255.255/32'),
 ]
 acceptable_device_status = [
     'active',
