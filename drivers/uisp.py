@@ -22,6 +22,23 @@ _TYPE_MAP = {
     'bridge': 'bridge',
 }
 
+
+def _interface_type(identification: dict) -> str | None:
+    '''NetBox interface type for one identification block.
+
+    identification.type alone doesn't distinguish a real SFP+ cage from
+    an ordinary copper port - confirmed live on a Wave Pro: eth1 has
+    type "ethernet" (not "port", unlike its switched RJ45 siblings
+    eth0@0/eth0@1) and is explicitly named "SFP+ Port" by the device
+    itself, plus a negotiated status.speed of "10000-full" - matched
+    here on the name, which is the one signal that doesn't vary with
+    whatever happens to be plugged in at the time (unlike speed, which
+    downshifts on the ordinary copper ports depending on the far end).
+    '''
+    if 'sfp+' in (identification.get('name') or '').lower():
+        return '10gbase-x-sfpp'
+    return _TYPE_MAP.get(identification.get('type'))
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,7 +108,7 @@ class Uisp(drivers.base.DriverBase):
                 description=status.get('description') or '',
                 mtu=status.get('mtu'),
                 mac_address=[mac] if mac else [],
-                type=_TYPE_MAP.get(identification.get('type')),
+                type=_interface_type(identification),
             )
             interfaces.append(interface_record)
             interfaces_with_plugged.append((interface_record, status.get('plugged')))
