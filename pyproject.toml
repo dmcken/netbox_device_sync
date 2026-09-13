@@ -10,10 +10,7 @@ dependencies = [
     "paramiko>=5.0.0",
     "pynetbox>=7.7.0",
     "python-dotenv>=1.2.2",
-    "ubnt-automata",
+    "ubnt-automata @ git+https://github.com/dmcken/ubnt_automata.git@v0.3.1",
     "vyattaconfparser>=0.5.5",
     "xmltodict>=1.0.4",
 ]
-
-[tool.uv.sources]
-ubnt-automata = { path = "../ubnt_automata", editable = true }

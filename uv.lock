@@ -624,7 +624,7 @@ requires-dist = [
     { name = "paramiko", specifier = ">=5.0.0" },
     { name = "pynetbox", specifier = ">=7.7.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
-    { name = "ubnt-automata", editable = "../ubnt_automata" },
+    { name = "ubnt-automata", git = "https://github.com/dmcken/ubnt_automata.git?rev=v0.3.1" },
     { name = "vyattaconfparser", specifier = ">=0.5.5" },
     { name = "xmltodict", specifier = ">=1.0.4" },
 ]
@@ -860,30 +860,10 @@ wheels = [
 
 [[package]]
 name = "ubnt-automata"
-source = { editable = "../ubnt_automata" }
+version = "0.3.1"
+source = { git = "https://github.com/dmcken/ubnt_automata.git?rev=v0.3.1#40a5fecf5626257fe3a590c1402593512009be8b" }
 dependencies = [
     { name = "requests" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "beautifulsoup4", marker = "extra == 'legacy'" },
-    { name = "check-manifest", marker = "extra == 'dev'" },
-    { name = "coverage", marker = "extra == 'test'" },
-    { name = "paramiko", marker = "extra == 'legacy'" },
-    { name = "pytest", marker = "extra == 'test'" },
-    { name = "requests" },
-    { name = "requests-mock", marker = "extra == 'test'" },
-    { name = "spur", marker = "extra == 'legacy'" },
-]
-provides-extras = ["dev", "legacy", "test"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.4.2" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "requests-mock", specifier = ">=1.12.1" },
-    { name = "ruff", specifier = ">=0.16.5" },
 ]
 
 [[package]]

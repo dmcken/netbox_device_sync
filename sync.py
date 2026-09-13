@@ -19,6 +19,7 @@ import traceback
 # External imports
 import dotenv
 import pynetbox
+import ubnt_automata
 
 # Local imports
 import drivers.airfiber
@@ -1710,6 +1711,68 @@ def parse_arguments() -> argparse.Namespace:
     args = parser.parse_args()
     return args
 
+# NetBox platform names ubnt_automata.determine_device_type() can
+# actually verify live -- RouterOS/JunOS/EdgeOS/Tachyon aren't in its
+# scope, so their platform tags are never live-checked or corrected.
+_UBNT_LIVE_DETECTABLE_PLATFORMS = {'AirOS v8', 'AirFiber', 'UISP'}
+
+
+def _detected_ubnt_platform_name(model_group: int, model_name: str) -> str | None:
+    '''The NetBox platform name that actually matches a live
+    ubnt_automata.determine_device_type() result, or None if the
+    result is inconclusive (unreachable/unknown) and nothing should
+    be corrected off the back of it.
+
+    model_group 8 covers both AirOS v8 and AirFiber -- they're the
+    same CGI-based login family (confirmed by st-atlas's own core.cpe
+    using a single AirOSv8 class for both), so model_name is what
+    actually distinguishes which product line this is.
+    '''
+    if model_group == 9:
+        return 'UISP'
+    if model_group == 8:
+        return 'AirFiber' if 'airfiber' in (model_name or '').lower() else 'AirOS v8'
+    return None
+
+
+def _correct_platform_if_misdetected(nb_api: pynetbox.api, device_nb, device_ip: str) -> str:
+    '''If `device_nb`'s NetBox platform is one ubnt_automata can live-
+    verify, checks it against a live ubnt_automata.determine_device_type()
+    result and corrects the NetBox record when they disagree (e.g. a
+    Wave Pro -- UISP-firmware -- device that was tagged AirFiber,
+    confirmed live to happen: NetBox platform tags for this family
+    have drifted from actual hardware before, and nothing else in this
+    sync catches that).
+
+    Always returns the platform name to actually use for driver
+    selection this run -- the corrected one if a correction was made,
+    otherwise device_nb's existing platform unchanged. Never raises:
+    a failed/inconclusive probe (device unreachable, wrong family
+    entirely) just falls back to trusting NetBox as before.
+    '''
+    current_platform_name = str(device_nb.platform)
+    if current_platform_name not in _UBNT_LIVE_DETECTABLE_PLATFORMS:
+        return current_platform_name
+
+    try:
+        info = ubnt_automata.determine_device_type(device_ip)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug(f"Live platform detection failed for '{device_nb.name}': {exc}")
+        return current_platform_name
+
+    detected_platform_name = _detected_ubnt_platform_name(info.model_group, info.model_name)
+    if detected_platform_name is None or detected_platform_name == current_platform_name:
+        return current_platform_name
+
+    logger.warning(
+        f"'{device_nb.name}' is tagged platform '{current_platform_name}' in NetBox, but live "
+        f"detection says it's actually '{detected_platform_name}' ({info.model_name}) -- correcting"
+    )
+    new_platform = nb_api.dcim.platforms.get(name=detected_platform_name)
+    device_nb.update({'platform': new_platform.id})
+    return detected_platform_name
+
+
 def main() -> None:
     '''Main sync function.
     '''
@@ -1780,15 +1843,17 @@ def main() -> None:
         device_ip = str(device_nb.primary_ip)
         try:
             logger.info(f"Processing: {device_nb.name}")
+            device_ip = str(ipaddress.ip_interface(device_nb.primary_ip).ip)
+
             # Build the driver and connect to the device
             # Create a driver passing it the credentials and the primary IP
+            platform_name = _correct_platform_if_misdetected(nb_api, device_nb, device_ip)
             try:
-                driver = platform_to_driver[str(device_nb.platform)]
+                driver = platform_to_driver[platform_name]
             except KeyError:
-                logger.error(f"Unsupported platform '{device_nb.platform}'")
+                logger.error(f"Unsupported platform '{platform_name}'")
                 continue
 
-            device_ip = str(ipaddress.ip_interface(device_nb.primary_ip).ip)
             full_dev_creds = {**device_credentials, 'hostname': device_ip}
             device_conn = driver(**full_dev_creds)
 
