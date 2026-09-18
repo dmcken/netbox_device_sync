@@ -481,14 +481,17 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
         except pynetbox.core.query.RequestError as exc:
             logger.error(f"Error processing {curr_ip} => {exc}")
 
-    # Now we need to check for those that need to be removed from netbox
-    to_del = set(nb_ipaddresses_dict.keys()).difference(set(map(lambda x: x.address, dev_ips)))
-    for curr_to_del in to_del:
-        logger.info(
-            f"Deleting IP record: {nb_ipaddresses_dict[curr_to_del].id}"
-            f"/{nb_ipaddresses_dict[curr_to_del].address}"
-        )
-        nb_ipaddresses_dict[curr_to_del].delete()
+    # Now we need to check for those that need to be removed from netbox.
+    # Iterate the raw nb_ipaddresses list, not nb_ipaddresses_dict - that
+    # dict is keyed by address, so duplicate Netbox records sharing the
+    # same stale address (seen in practice: repeated old sync runs left
+    # 5 identical records for one address on one interface) collapse to
+    # a single entry and only one of them would ever get deleted.
+    dev_ip_addresses = set(map(lambda x: x.address, dev_ips))
+    for nb_ip in nb_ipaddresses:
+        if ipaddress.ip_interface(nb_ip.address) not in dev_ip_addresses:
+            logger.info(f"Deleting IP record: {nb_ip.id}/{nb_ip.address}")
+            nb_ip.delete()
 
     return
 
