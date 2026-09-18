@@ -487,6 +487,20 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
     # same stale address (seen in practice: repeated old sync runs left
     # 5 identical records for one address on one interface) collapse to
     # a single entry and only one of them would ever get deleted.
+    #
+    # Skip entirely if the device reported zero IPs: a connection/auth
+    # failure already raises before reaching here, so an empty dev_ips
+    # means either a genuinely IP-less device (rare) or a driver quietly
+    # returning nothing instead of raising - either way, trusting that as
+    # "every existing record is now stale" risks wiping a device's real
+    # data on a bad read rather than skipping it for this run.
+    if not dev_ips:
+        logger.warning(
+            f"{device_nb.name} reported zero IPs - skipping stale IP "
+            "cleanup for this device rather than risk deleting everything."
+        )
+        return
+
     dev_ip_addresses = set(map(lambda x: x.address, dev_ips))
     for nb_ip in nb_ipaddresses:
         if ipaddress.ip_interface(nb_ip.address) not in dev_ip_addresses:
