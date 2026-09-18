@@ -359,31 +359,64 @@ def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.Drive
     for curr_int_to_delete in nb_interfaces_to_delete:
         curr_int_to_delete.delete()
 
-def create_ip_address(nb: pynetbox.api, curr_ip, nb_interface_dict) -> None:
+def _vrrp_role(interface_name: str) -> str | None:
+    """Netbox IP-address role to tag a VRRP virtual IP with, or None.
+
+    Netbox rejects a second IP-address record for an address already used
+    elsewhere ("Duplicate IP address found in global table") unless every
+    conflicting record's role is one of a handful Netbox treats as
+    intentionally shared - confirmed empirically against this instance:
+    vrrp/anycast/vip/hsrp/glbp/carp all bypass the check, secondary and
+    loopback (and no role at all) don't. A VRRP virtual IP is exactly
+    this case: both members of an HA pair legitimately report the same
+    address, so each needs its own record tagged role=vrrp rather than
+    the second one failing to register at all.
+
+    Netbox strips the interface-name suffix RouterOS assigns (matching
+    sync_interfaces()'s own whitespace-stripped names), so 'vrrp_v0501'
+    style names - this driver's convention for a VRRP interface - are
+    identified by prefix.
+    """
+    if interface_name and interface_name.lower().startswith('vrrp'):
+        return 'vrrp'
+    return None
+
+def create_ip_address(nb: pynetbox.api, curr_ip, nb_interface_dict, role: str | None = None) -> None:
     """Create IP address.
 
     Args:
         nb (_type_): _description_
         curr_ip (_type_): _description_
         nb_interface_dict (_type_): _description_
+        role (str | None): Netbox IP-address role, e.g. 'vrrp' - lets a
+            shared virtual IP be registered on more than one interface
+            without Netbox's global-uniqueness check rejecting it.
     """
     logger.info(f"Creating IP record: {curr_ip}")
+    create_kwargs = {}
+    if role:
+        create_kwargs['role'] = role
     nb.ipam.ip_addresses.create(
         assigned_object_id=nb_interface_dict[curr_ip.interface].id,
         assigned_object_type='dcim.interface',
         address=str(curr_ip.address),
         status=curr_ip.status,
         vrf=curr_ip.vrf,
+        **create_kwargs,
     )
     return
 
-def update_ip_address(curr_ip, nb_ip_record, nb_interface_dict) -> None:
+def update_ip_address(curr_ip, nb_ip_record, nb_interface_dict, role: str | None = None) -> None:
     """Update IP address in netbox.
 
     Args:
         curr_ip (_type_): _description_
         nb_ip_record (_type_): _description_
         nb_interface_dict (_type_): _description_
+        role (str | None): Expected Netbox IP-address role - corrected on
+            the existing record if it doesn't already match (e.g. a VRRP
+            IP created before this device's peer also started reporting
+            it, so it was never tagged role=vrrp in the first place).
     """
     logger.debug(f"Checking IP record for changes: {curr_ip}")
     if len(nb_ip_record) == 1:
@@ -408,6 +441,12 @@ def update_ip_address(curr_ip, nb_ip_record, nb_interface_dict) -> None:
         if nb_ip_record[0].vrf != curr_ip.vrf:
             nb_ip_record[0].vrf = curr_ip.vrf
             logger.info("Updating vrf")
+            changed = True
+
+        curr_role = nb_ip_record[0].role.value if nb_ip_record[0].role else None
+        if role and curr_role != role:
+            logger.info(f"Updating role: {curr_role} -> {role}")
+            nb_ip_record[0].role = role
             changed = True
 
         if changed:
@@ -467,17 +506,23 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
                     status='active',
                 )
 
+            role = _vrrp_role(curr_ip.interface)
             nb_ip_record = list(nb_api.ipam.ip_addresses.filter(address=curr_ip.address))
-            if nb_ip_record:
-                # We only want to update if its on the same device or not assigned to anything.
-                if nb_ip_record[0].assigned_object_type is None or \
-                    (nb_ip_record[0].assigned_object_type == 'dcim.interface' \
-                    and nb_ip_record[0].assigned_object_id in nb_interface_id_list):
-                    update_ip_address(curr_ip, nb_ip_record, nb_interface_dict)
-                else:
-                    create_ip_address(nb_api, curr_ip, nb_interface_dict)
+            # We only want to update records already unassigned or already
+            # on one of this device's own interfaces. A record assigned to
+            # a different device's interface (e.g. a VRRP peer reporting
+            # the same shared virtual IP) is left untouched - each side
+            # gets its own record instead of one clobbering the other.
+            own_records = [
+                r for r in nb_ip_record
+                if r.assigned_object_type is None
+                or (r.assigned_object_type == 'dcim.interface'
+                    and r.assigned_object_id in nb_interface_id_list)
+            ]
+            if own_records:
+                update_ip_address(curr_ip, own_records, nb_interface_dict, role)
             else:
-                create_ip_address(nb_api, curr_ip, nb_interface_dict)
+                create_ip_address(nb_api, curr_ip, nb_interface_dict, role)
         except pynetbox.core.query.RequestError as exc:
             logger.error(f"Error processing {curr_ip} => {exc}")
 
