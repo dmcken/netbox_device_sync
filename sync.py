@@ -298,6 +298,14 @@ def sync_interfaces(nb: pynetbox.api, device_nb, device_conn: drivers.base.Drive
     nb_interface_dict = {v.name:v for v in nb_interfaces}
     nb_interfaces_names = set(map(lambda x: x.name, nb_interfaces))
     dev_interfaces = device_conn.get_interfaces()
+    # Netbox strips leading/trailing whitespace from interface names on
+    # save, but a device can report one with stray whitespace baked into
+    # its own config (e.g. a fat-fingered name on the box). Left
+    # unstripped here, that interface never matches its already-existing
+    # Netbox counterpart, so it's treated as new, the create fails as a
+    # duplicate, and the KeyError below crashes the whole device.
+    for curr_dev_interface in dev_interfaces:
+        curr_dev_interface.name = curr_dev_interface.name.strip()
     dev_interfaces_names = set(map(lambda x: x.name, dev_interfaces))
     # logger.info("Interface data for '{0}'\n{1}".format(device_nb.name,
     # pprint.pformat(dev_interfaces, width=200)))
@@ -421,6 +429,12 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
 
     # - IP Addresses - The matching interfaces should already exist (create the matching prefixes)
     dev_ips = device_conn.get_ipaddresses()
+    # Match sync_interfaces()'s whitespace stripping: a device-reported
+    # interface name with stray whitespace otherwise never matches its
+    # already-stripped Netbox counterpart below.
+    for curr_ip in dev_ips:
+        if curr_ip.interface is not None:
+            curr_ip.interface = curr_ip.interface.strip()
     for curr_network_to_ignore in utils.networks_to_ignore:
         dev_ips = list(filter(
             lambda x: x.address not in curr_network_to_ignore, dev_ips
