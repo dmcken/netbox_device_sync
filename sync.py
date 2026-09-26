@@ -381,6 +381,42 @@ def _vrrp_role(interface_name: str) -> str | None:
         return 'vrrp'
     return None
 
+def _tag_shared_interface_ip(nb_ip_record, interface_name: str, own_interface_ids) -> bool:
+    """True if this address should be tagged role=vrrp because a peer
+    device already has it on an identically-named interface - the same
+    HA-pair-sharing pattern as a vrrp_* interface, just without that
+    naming convention (e.g. FW01 and FW03 both configure a bond_v0152
+    interconnect with the identical address). Retags that peer record
+    role=vrrp too if it isn't already, since Netbox's uniqueness
+    exemption requires every conflicting record to carry an exempt role,
+    not just the new one - otherwise whichever device's record already
+    existed (created back when there was no conflict yet to react to)
+    permanently blocks the other, regardless of sync order.
+
+    Not applied when the conflicting record's interface name differs (a
+    different device reporting the same address on a differently-named
+    interface is a separate, unexplained conflict worth investigating
+    rather than silently tagging as intentional).
+    """
+    found = False
+    for record in nb_ip_record:
+        if record.assigned_object_type != 'dcim.interface' or record.assigned_object is None:
+            continue
+        if record.assigned_object_id in own_interface_ids:
+            continue
+        if getattr(record.assigned_object, 'name', None) != interface_name:
+            continue
+        found = True
+        peer_role = record.role.value if record.role else None
+        if peer_role != 'vrrp':
+            logger.info(
+                f"Retagging peer record role for shared interface "
+                f"'{interface_name}': {peer_role} -> vrrp"
+            )
+            record.role = 'vrrp'
+            record.save()
+    return found
+
 def create_ip_address(nb: pynetbox.api, curr_ip, nb_interface_dict, role: str | None = None) -> None:
     """Create IP address.
 
@@ -478,6 +514,15 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
         dev_ips = list(filter(
             lambda x: x.address not in curr_network_to_ignore, dev_ips
         ))
+    # RouterOS reports its SSTP server's own local/gateway address
+    # identically on every ephemeral <sstp-XXXXXXXX> client-session
+    # interface - the same device colliding with itself, not a distinct
+    # per-client address, and not something worth a Netbox record per
+    # session (they also churn as clients connect/disconnect).
+    dev_ips = list(filter(
+        lambda x: not (x.interface and x.interface.lower().startswith('<sstp-')),
+        dev_ips
+    ))
     logger.debug(
         f"Raw IP data for '{device_nb.name}'\n" +
         f"{pprint.pformat(dev_ips, width=200)}"
@@ -508,6 +553,15 @@ def sync_ips(nb_api: pynetbox.api, device_nb, device_conn: drivers.base.DriverBa
 
             role = _vrrp_role(curr_ip.interface)
             nb_ip_record = list(nb_api.ipam.ip_addresses.filter(address=curr_ip.address))
+            # Checked unconditionally, not just when we have no record of
+            # our own yet: whichever device's record already existed
+            # before its peer ever reported this address was created back
+            # when there was no conflict yet to react to, so it needs
+            # retagging on this pass regardless of which side we are.
+            if not role and _tag_shared_interface_ip(
+                nb_ip_record, curr_ip.interface, nb_interface_id_list
+            ):
+                role = 'vrrp'
             # We only want to update records already unassigned or already
             # on one of this device's own interfaces. A record assigned to
             # a different device's interface (e.g. a VRRP peer reporting
