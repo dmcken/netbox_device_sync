@@ -380,6 +380,52 @@ class JunOS(drivers.base.DriverBase):
 
         return routes
 
+    def get_neighbours(self,) -> list[drivers.base.Neighbour]:
+        """Get LLDP neighbours to this device.
+
+        Only the local port id is authoritative here - the remote port
+        is exposed by Junos as a free-text *description* someone
+        configured on that port, not its actual port ID (e.g. it can
+        read "DC1-SPINE1-B4_xe-0/0/43" for a neighbour actually named
+        "DC1-ToR-A9-1" - a stale/unrelated label, not the port name).
+        It's kept in remote_interface as a best-effort hint only; the
+        caller must confirm it against the neighbour's own reported
+        local port before trusting it for anything like Cable creation.
+        """
+        res_neighbours = []
+
+        result = self._dev.rpc.get_lldp_neighbors_information()
+        neighbours = xmltodict.parse(
+            etree.tostring(result)
+        ).get('lldp-neighbors-information') or {}
+        entries = neighbours.get('lldp-neighbor-information') or []
+        if isinstance(entries, dict):
+            entries = [entries]
+
+        for entry in entries:
+            remote_name = entry.get('lldp-remote-system-name')
+            if not remote_name:
+                # No usable identity for this neighbour (some devices
+                # don't advertise a system name) - nothing to correlate
+                # it against, so not worth carrying forward.
+                continue
+
+            mac = []
+            chassis_id = entry.get('lldp-remote-chassis-id')
+            chassis_id_subtype = entry.get('lldp-remote-chassis-id-subtype', '')
+            if chassis_id and 'mac' in chassis_id_subtype.lower():
+                mac.append(chassis_id)
+
+            res_neighbours.append(drivers.base.Neighbour(
+                mac=mac,
+                name=remote_name,
+                interface=entry.get('lldp-local-port-id'),
+                remote_interface=entry.get('lldp-remote-port-description'),
+                source='LLDP',
+            ))
+
+        return res_neighbours
+
 
 
 

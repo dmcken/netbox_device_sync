@@ -80,11 +80,20 @@ class Neighbour:
 
     extra_data:
     - static: Mark an entry as a static ARP or DHCP entry.
+
+    remote_interface: the neighbour's own port, as THIS device's LLDP/CDP
+    implementation reports it. For an LLDP source this is a best-effort
+    hint only - some platforms (e.g. Junos) only expose the remote port's
+    free-text *description*, not its actual port ID, so it can be
+    unreliable or entirely absent. Never trust it alone for building a
+    Cable; confirm against that neighbour's own reported local port
+    first (see sync_cables.py).
     '''
     mac: list[str] = None
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address = None
     name: str = None
     interface: str = None
+    remote_interface: str = None
     source: str = None
     extra_data: str = None
 

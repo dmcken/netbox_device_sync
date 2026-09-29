@@ -229,15 +229,6 @@ class RouterOS(drivers.base.DriverBase):
             #         'interface': 'interface',
             #     }
             # },
-            # 'LLDP':  {
-            #     'path': self._dev.path('ip','neighbor'),
-            #     'map': {
-            #         'mac': 'mac-address',
-            #         'ip': 'address',
-            #         'interface': 'interface',
-            #         'name': 'identity',
-            #     },
-            # },
             #'NDP':   {'path': self._dev.path('ipv6','neighbour') },
             #'DHCP6': {'path': self._dev.path('ipv6','dhcp-server','binding') },
         }
@@ -260,5 +251,36 @@ class RouterOS(drivers.base.DriverBase):
 
                 neighbour_rec = drivers.base.Neighbour(**entry_data)
                 res_neighbours.append(neighbour_rec)
+
+        # LLDP is handled separately from the generic map-driven loop
+        # above: RouterOS's '/ip/neighbor' table also surfaces CDP/MNDP
+        # neighbours discovered over virtual links (EoIP tunnels, VPN
+        # peers) - those aren't physical connections and must never be
+        # mistaken for one, so only entries RouterOS attributes to LLDP
+        # alone are kept (discovered-by is a comma-joined list of every
+        # protocol that saw the neighbour; a mixed 'cdp,lldp' value seen
+        # in practice on tunnel interfaces means LLDP is riding the
+        # virtual link too, not that there's a real cable). The
+        # 'interface' field is itself a comma-joined list (the physical
+        # port, then any bridge/bond it's a member of) - only the first,
+        # physical entry is kept, since a Cable terminates on a real
+        # port, not a bridge.
+        for entry in self._dev.path('ip', 'neighbor'):
+            if entry.get('discovered-by') != 'lldp':
+                continue
+            identity = entry.get('identity')
+            if not identity:
+                continue
+
+            mac = [entry['mac-address']] if entry.get('mac-address') else []
+            local_interface = entry.get('interface', '').split(',')[0] or None
+
+            res_neighbours.append(drivers.base.Neighbour(
+                mac=mac,
+                name=identity,
+                interface=local_interface,
+                remote_interface=entry.get('interface-name'),
+                source='LLDP',
+            ))
 
         return res_neighbours
