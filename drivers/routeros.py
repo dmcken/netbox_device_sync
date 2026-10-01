@@ -4,13 +4,13 @@
 import ipaddress
 import logging
 import pprint
-import socket
 
 # External import
 import librouteros
 
 # Local import
 import drivers.base
+from drivers._routeros_rest import RestDevice, RestError
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +48,35 @@ class RouterOS(drivers.base.DriverBase):
             # Connection type, 6.43 and later use plain, before that uses token
             # https://librouteros.readthedocs.io/en/3.2.0/connect.html
             # kwargs['login_method'] = librouteros.login.plain
-            logger.debug(f"Attempting to connect to RouterOS device: {kwargs}")
+            logger.debug(f"Attempting to connect to RouterOS device: {kwargs['host']}")
             self._dev = librouteros.connect(**kwargs)
         except librouteros.exceptions.TrapError as exc:
             # TODO: Check for specific message 'invalid user name or password (6)'
             raise drivers.base.AuthenticationError() from exc
-        except socket.timeout as exc:
-            raise drivers.base.ConnectError() from exc
+        except OSError as exc:
+            # API service (8728) off/refused/timing out - many devices only
+            # run the REST API (/ip service www), so fall back to that.
+            logger.info(
+                f"RouterOS API unavailable on {kwargs['host']} ({exc}), trying REST"
+            )
+            self._dev = self._connect_rest(**kwargs)
+
+    @staticmethod
+    def _connect_rest(**kwargs) -> RestDevice:
+        """Connect over the REST API instead - see drivers._routeros_rest.
+
+        Raises:
+            drivers.base.AuthenticationError: REST rejected the credentials.
+            drivers.base.ConnectError: REST unreachable too.
+        """
+        dev = RestDevice(kwargs['host'], kwargs['username'], kwargs['password'])
+        try:
+            dev.get('system/identity')  # cheap probe, so failures surface here
+        except RestError as exc:
+            if '401' in str(exc):
+                raise drivers.base.AuthenticationError() from exc
+            raise drivers.base.ConnectError(str(exc)) from exc
+        return dev
 
     def _close(self,) -> None:
         """Close connection to device.
