@@ -102,6 +102,11 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+
+# Leftover local-credentials file from early sync_ip_pools.py development -
+# never imported (NB_TOKEN/DEV_PASSWORD come from the environment, like
+# everywhere else in this project), but holds live secrets if it exists.
+config.py
 .env
 .venv
 env/

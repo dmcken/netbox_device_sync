@@ -98,6 +98,19 @@ class Neighbour:
     extra_data: str = None
 
 @dataclasses.dataclass
+class IPPool:
+    '''An address pool (e.g. RouterOS /ip/pool, used for DHCP/PPP address
+    assignment). Not all platforms have an equivalent concept, so unlike
+    Interface/IPAddress this isn't part of DriverBase's required set -
+    only drivers that actually support it implement get_ip_pools().
+    '''
+    name: str
+    ranges: str = None
+    total: int = None
+    used: int = None
+    available: int = None
+
+@dataclasses.dataclass
 class GPSCoordinate:
     '''GPS location as reported by a device with built-in GPS - used to
     backfill a Site's own location from whichever device at that tower
@@ -217,7 +230,8 @@ class DriverBase(metaclass = abc.ABCMeta):
             except KeyError:
                 continue
 
-        logger.debug(f"Creds within base: {creds}")
+        redacted_creds = {k: ('***' if k in ('passwd', 'password') else v) for k, v in creds.items()}
+        logger.debug(f"Creds within base: {redacted_creds}")
 
         self._connect(**creds)
 

@@ -341,3 +341,19 @@ class RouterOS(drivers.base.DriverBase):
             ))
 
         return neighbours
+    def get_ip_pools(self,) -> list[drivers.base.IPPool]:
+        """Get configured IP pools (/ip/pool) and their current
+        used/free counts - RouterOS tracks this itself (reflecting live
+        DHCP/PPP lease state), so it's read directly rather than
+        computed from the pool's address range.
+        """
+        return [
+            drivers.base.IPPool(
+                name=entry['name'],
+                ranges=entry.get('ranges'),
+                total=entry.get('total'),
+                used=entry.get('used'),
+                available=entry.get('available'),
+            )
+            for entry in self._dev.path('ip', 'pool')
+        ]
