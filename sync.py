@@ -1562,6 +1562,24 @@ def _find_backhaul_ethernet_port(nb_api: pynetbox.api, device_id: int):
     ip = ips[0]
     ip_interface = nb_api.dcim.interfaces.get(id=ip.assigned_object_id)
     physical = _resolve_physical_port(nb_api, ip_interface)
+
+    if physical is None and ip_interface.type and ip_interface.type.value == 'bridge':
+        # Some AirFiber 5X HD units split their radio and ethernet port
+        # across two separate bridges - the IP sits on br0 (whose only
+        # member is the wireless radio chain, itself never a usable
+        # cable port), while the real ethernet uplink lives on its own
+        # second bridge, br2, with no IP of its own (confirmed live on
+        # BH_CON>HFH/BH_HFH>CON/BH_JEM>SOL/BH_SOL>JEM, all this same
+        # device type). Only used when there's exactly one other bridge
+        # on the device and it resolves to exactly one physical member,
+        # so this stays a recovered fact rather than a guess.
+        other_bridges = [
+            iface for iface in nb_api.dcim.interfaces.filter(device_id=device_id)
+            if iface.type and iface.type.value == 'bridge' and iface.id != ip_interface.id
+        ]
+        if len(other_bridges) == 1:
+            physical = _resolve_physical_port(nb_api, other_bridges[0])
+
     if physical is None:
         return None, None
 
