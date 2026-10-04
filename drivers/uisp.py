@@ -113,6 +113,56 @@ class Uisp(drivers.base.DriverBase):
             interfaces.append(interface_record)
             interfaces_with_plugged.append((interface_record, status.get('plugged')))
 
+        # UISP's own API never reports bridge port membership at all -
+        # unlike the .cgi-family driver (see _ubnt_cgi_common.py), there
+        # isn't even a sometimes-empty config key to read it from. The
+        # one signal available here is the same one that forces
+        # dedupe_macs_by_plugged() to exist below: a bridge's physical
+        # member(s) report the exact same hwaddr as the bridge interface
+        # itself (confirmed live on a UISP-firmware AirFiber 60 XR and a
+        # Wave Pro). Matching on that recovers the membership instead of
+        # leaving it unresolvable on every UISP device, always.
+        bridges = [rec for rec in interfaces if rec.type == 'bridge']
+        bridge_macs = {rec.name: rec.mac_address[0] for rec in bridges if rec.mac_address}
+        if bridge_macs:
+            for interface_record in interfaces:
+                if interface_record.type in ('bridge', 'lag'):
+                    continue
+                match = next(
+                    (
+                        bridge_name for bridge_name, bridge_mac in bridge_macs.items()
+                        if bridge_mac in interface_record.mac_address
+                    ),
+                    None,
+                )
+                if match:
+                    interface_record.bridge = match
+
+        # Confirmed live on a BH_*>DAN backhaul radio: the MAC match
+        # above landed on the bridge's own radio chain (ath0/wlan0 -
+        # itself excluded elsewhere as wireless, never a usable cable
+        # port) rather than its ethernet uplink, leaving the real port
+        # unidentified. A device with exactly one bridge and no other
+        # signal left falls back to status.plugged - a port actually
+        # plugged in is itself live evidence of membership, the same
+        # "plugged" signal dedupe_macs_by_plugged() already relies on
+        # for this exact ambiguity - but only when it narrows to one
+        # candidate, so this stays a recovered fact, not a guess.
+        _RADIO_NAMES = {'ath0', 'wlan0'}
+        if len(bridges) == 1:
+            bridge_name = bridges[0].name
+            has_physical_member = any(
+                rec.bridge == bridge_name and rec.name not in _RADIO_NAMES
+                for rec in interfaces
+            )
+            if not has_physical_member:
+                plugged_candidates = [
+                    rec for rec, plugged in interfaces_with_plugged
+                    if plugged and rec.type not in ('bridge', 'lag') and rec.name not in _RADIO_NAMES
+                ]
+                if len(plugged_candidates) == 1:
+                    plugged_candidates[0].bridge = bridge_name
+
         drivers._ubnt_iface_utils.dedupe_macs_by_plugged(interfaces_with_plugged)
 
         # Bridges/parents first, matching the ordering contract documented
