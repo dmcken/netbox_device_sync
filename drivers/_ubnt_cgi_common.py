@@ -114,9 +114,15 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
         }
 
     @staticmethod
-    def _map_bridge_ports(cfg: dict[str, str]) -> dict[str, str]:
+    def _map_bridge_ports(cfg: dict[str, str]) -> tuple[dict[str, str], set[str]]:
         '''Map {member interface devname: bridge devname} from the flat
-        'bridge.N.devname'/'bridge.N.port.M.devname' keys.'''
+        'bridge.N.devname'/'bridge.N.port.M.devname' keys, plus the set
+        of every bridge devname seen - including ones with zero listed
+        ports (confirmed live: a single-radio, non-bonded AirFiber 60
+        HD reports 'bridge.1.devname=br0' but no 'bridge.1.port.*.
+        devname' keys at all), since get_interfaces() still needs a
+        bridge's own name even when it can't attribute any member ports
+        to it from this data alone.'''
         bridges: dict[str, dict] = {}
         for key, val in cfg.items():
             parts = key.split('.')
@@ -130,24 +136,27 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
                 entry['ports'].append(val)
 
         port_to_bridge = {}
+        bridge_names = set()
         for entry in bridges.values():
             bridge_name = entry.get('devname')
             if not bridge_name:
                 continue
+            bridge_names.add(bridge_name)
             for port in entry['ports']:
                 port_to_bridge[port] = bridge_name
 
-        return port_to_bridge
+        return port_to_bridge, bridge_names
 
     def get_interfaces(self) -> list[drivers.base.Interface]:
         '''Build Interface records from status.cgi's `interfaces` array
         (the authoritative live interface list, with MAC/MTU/enabled),
         enriched with getcfg.cgi's bridge membership.'''
         status = self._fetch_status()
-        port_to_bridge = self._map_bridge_ports(self._fetch_cfg())
+        port_to_bridge, bridge_names = self._map_bridge_ports(self._fetch_cfg())
 
         interfaces = []
         interfaces_with_plugged = []
+        bridge_macs = {}
         for curr_int in status.get('interfaces', []):
             name = curr_int['ifname']
             mac = curr_int.get('hwaddr')
@@ -161,9 +170,11 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
             if name in port_to_bridge:
                 interface_record.bridge = port_to_bridge[name]
 
-            if name in port_to_bridge.values():
+            if name in bridge_names:
                 # This interface is itself a bridge.
                 interface_record.type = 'bridge'
+                if mac:
+                    bridge_macs[name] = mac
             elif _UBOND_RE.match(name):
                 # AirFiber's uBond (adaptive multi-chain radio bonding) -
                 # confirmed live on an AirFiber 60: ubond0 reports the
@@ -178,6 +189,30 @@ class UbntCgiDriverBase(drivers.base.DriverBase):
             interfaces_with_plugged.append(
                 (interface_record, curr_int.get('status', {}).get('plugged'))
             )
+
+        # A bridge with no port_to_bridge members at all (see
+        # _map_bridge_ports) still has one other live signal: a non-
+        # bonded AirFiber 60 HD's ueth0/ueth1 report the exact same
+        # hwaddr as br0 itself (confirmed live - also why
+        # dedupe_macs_by_plugged() below has to collapse them to one).
+        # Matching on that shared MAC recovers the membership this
+        # firmware never lists explicitly, instead of leaving every
+        # such device's bridge forever unresolvable.
+        unexplained_bridges = bridge_names - set(port_to_bridge.values())
+        if unexplained_bridges:
+            for interface_record in interfaces:
+                if interface_record.type in ('bridge', 'lag'):
+                    continue
+                match = next(
+                    (
+                        bridge_name for bridge_name, bridge_mac in bridge_macs.items()
+                        if bridge_name in unexplained_bridges
+                        and bridge_mac in interface_record.mac_address
+                    ),
+                    None,
+                )
+                if match:
+                    interface_record.bridge = match
 
         drivers._ubnt_iface_utils.dedupe_macs_by_plugged(interfaces_with_plugged)
 
