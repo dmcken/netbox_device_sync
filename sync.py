@@ -49,8 +49,11 @@ _WIRELESS_INTERFACE_TYPES = {
 # of the cable is that device's named port. Matched as a prefix, not the
 # whole description - confirmed live that some descriptions have trailing
 # text after the bracket (e.g. "DAN-SW0031 [sfp-sfpplus2] / Was Roylances
-# UXG"). See sync_cable_descriptions().
-_CABLE_DESC_RE = re.compile(r'^([^\[\]]+?)\s*\[([^\[\]]+)\]')
+# UXG"). Also accepts "Device (Port)" parens - confirmed live fleet-wide
+# (e.g. "DAN-CE5 (sfp-sfpplus8)") to actually be the more common of the
+# two forms (185 parenthesised descriptions found fleet-wide vs 46
+# bracketed ones), not a one-off variant. See sync_cable_descriptions().
+_CABLE_DESC_RE = re.compile(r'^([^\[\]()]+?)\s*(?:\[([^\[\]]+)\]|\(([^()]+)\))')
 
 # NetBox Interface.type values that aren't a real, single cable-terminable
 # port - used by the /30-/31 and /29 subnet-inference rules below to avoid
@@ -1426,7 +1429,7 @@ def sync_cable_descriptions(nb_api: pynetbox.api) -> None:
             continue
 
         remote_device_name = match.group(1).strip()
-        remote_port_name = match.group(2).strip()
+        remote_port_name = (match.group(2) or match.group(3)).strip()
 
         # A single lookup covers both "ignore" conditions at once - a
         # nonexistent port on a real device just comes back as no result,
