@@ -1441,6 +1441,27 @@ def sync_cable_descriptions(nb_api: pynetbox.api) -> None:
             remote_interface = None
 
         if remote_interface is None:
+            # The exact-name lookup above is case-sensitive, but not
+            # every device reports its own port names in the same case
+            # NetBox stores them in - confirmed live on a Tachyon
+            # TNS-100, whose own port labels read e.g. "AUS-TAP-N
+            # [ETH0]" while the real NetBox interface is "eth0", so the
+            # description was always well-formed and just never
+            # matched. Falls back to a case-insensitive match across
+            # that device's own interfaces rather than assuming NetBox's
+            # API exposes a case-insensitive filter for this field.
+            try:
+                remote_interface = next(
+                    (
+                        iface for iface in nb_api.dcim.interfaces.filter(device=remote_device_name)
+                        if iface.name.lower() == remote_port_name.lower()
+                    ),
+                    None,
+                )
+            except pynetbox.core.query.RequestError:
+                remote_interface = None
+
+        if remote_interface is None:
             logger.debug(
                 f"Cabling description '{interface.description}' on "
                 f"'{interface.device.name}'/{interface.name} doesn't resolve "
