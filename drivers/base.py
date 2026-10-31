@@ -184,6 +184,27 @@ class OspfNeighbour:
     neighbour_address: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     state: str = None
 
+@dataclasses.dataclass
+class EoipTunnel:
+    '''One EoIP (Ethernet-over-IP, a MikroTik-specific tunnel type)
+    interface on this device, used to correlate point-to-point EoIP
+    pseudowires into NetBox L2VPN (type vpws) objects -- see
+    sync_l2vpns.py.
+
+    tunnel_id is RouterOS's own tunnel multiplexing ID: two EoIP
+    interfaces only carry the same traffic if both their
+    remote_address *and* tunnel_id agree -- a device commonly runs
+    several unrelated EoIP tunnels to the same remote_address (one
+    public IP multiplexing many tunnels via distinct tunnel_ids), so
+    remote_address alone can't pair two interfaces.
+    '''
+    interface: str
+    remote_address: ipaddress.IPv4Address | ipaddress.IPv6Address | None
+    tunnel_id: int | None
+    running: bool
+    disabled: bool
+
+
 # Factories
 class DriverFactory:
     """Base factory for all driver objects"""

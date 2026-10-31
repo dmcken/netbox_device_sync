@@ -341,6 +341,36 @@ class RouterOS(drivers.base.DriverBase):
             ))
 
         return neighbours
+    def get_eoip_tunnels(self,) -> list[drivers.base.EoipTunnel]:
+        """Get this device's EoIP tunnel interfaces (interface/eoip) -
+        confirmed live on a real CCR2004 (RouterOS v7.25): {name,
+        remote-address, tunnel-id, running, disabled, ...} per tunnel.
+        remote-address is occasionally unset (seen live on a disabled/
+        never-configured tunnel) - reported as None rather than
+        raising, same tolerance get_ospf_neighbours() has for a
+        neighbour's optional address.
+
+        Returns:
+            list[drivers.base.EoipTunnel]: This device's EoIP tunnels,
+                empty if it has none configured.
+        """
+        tunnels = []
+        for entry in self._dev.path('interface', 'eoip'):
+            try:
+                remote_address = ipaddress.ip_address(entry['remote-address'])
+            except (KeyError, ValueError):
+                remote_address = None
+
+            tunnels.append(drivers.base.EoipTunnel(
+                interface=entry['name'],
+                remote_address=remote_address,
+                tunnel_id=entry.get('tunnel-id'),
+                running=bool(entry.get('running')),
+                disabled=bool(entry.get('disabled')),
+            ))
+
+        return tunnels
+
     def get_ip_pools(self,) -> list[drivers.base.IPPool]:
         """Get configured IP pools (/ip/pool) and their current
         used/free counts - RouterOS tracks this itself (reflecting live
