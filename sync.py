@@ -981,17 +981,17 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
     can't be responsibly created - no hostname to name it after, no
     NetBox device type its reported model fuzzy-matches, or the AP
     itself has no site to place it at.
+
+    Named "<prefix><MAC, no colons>" -- same convention as
+    core.cpe.provision_cpe()'s CPE placeholders -- rather than after
+    the peer's own reported hostname, since that's free text a
+    customer could rename or duplicate; the hostname is preserved in
+    the device's `description` instead. A device already auto-created
+    under this function's old hostname-based naming is found by its
+    MAC (stable across the rename, unlike the old name) and migrated
+    in place -- name and description both corrected -- rather than
+    duplicated.
     """
-    # Confirmed live: NetBox silently trims leading/trailing whitespace
-    # from a device's name on save (a peer's own hostname is free text,
-    # and some report one with a trailing space), but a later lookup
-    # using the untrimmed string doesn't match the trimmed stored name -
-    # not a "not found" (which this function already handles by
-    # creating one), but a hard validation error on the interface
-    # lookup below, which previously aborted the rest of this AP's
-    # sync entirely. Stripping once up front keeps the name this
-    # function creates/looks up consistent with what NetBox actually
-    # stores.
     hostname = peer.hostname.strip() if peer.hostname else None
     if not hostname:
         return None
@@ -1013,9 +1013,22 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
         )
         return None
 
-    device_name = f"{convention['name_prefix']}{hostname}"
+    device_name = f"{convention['name_prefix']}{peer.mac.replace(':', '').upper()}"
 
-    device_nb = nb_api.dcim.devices.get(name=device_name)
+    # A device already auto-created under the old hostname-based name
+    # is found by its MAC -- unaffected by the rename -- rather than by
+    # name, so re-running this migrates it in place instead of creating
+    # a duplicate alongside it.
+    device_nb = None
+    existing_mac = fetch_nb_mac(nb_api, peer.mac)
+    if existing_mac is not None and existing_mac.assigned_object_type == 'dcim.interface':
+        existing_interface = nb_api.dcim.interfaces.get(id=existing_mac.assigned_object_id)
+        if existing_interface is not None:
+            device_nb = nb_api.dcim.devices.get(id=existing_interface.device.id)
+
+    if device_nb is None:
+        device_nb = nb_api.dcim.devices.get(name=device_name)
+
     if device_nb is None:
         role = nb_api.dcim.device_roles.get(slug='cpe-dish')
         device_nb = nb_api.dcim.devices.create(
@@ -1024,13 +1037,29 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
             role=role.id,
             site=ap_device_nb.site.id,
             status='active',
+            description=hostname,
         )
         logger.info(
             f"Created client device '{device_name}' ({device_type.model}) at "
-            f"'{ap_device_nb.site.name}', seen as a peer of '{ap_device_nb.name}'"
+            f"'{ap_device_nb.site.name}', seen as a peer of '{ap_device_nb.name}' "
+            f"(hostname: '{hostname}')"
         )
+    else:
+        changes = {}
+        if device_nb.name != device_name:
+            changes['name'] = {'old': device_nb.name, 'new': device_name}
+            device_nb.name = device_name
+        if device_nb.description != hostname:
+            changes['description'] = {'old': device_nb.description, 'new': hostname}
+            device_nb.description = hostname
+        if changes:
+            device_nb.save()
+            logger.info(
+                f"Migrated client device to '{device_name}', seen as a peer of "
+                f"'{ap_device_nb.name}' => {changes}"
+            )
 
-    peer_interface = nb_api.dcim.interfaces.get(device=device_name, name='wlan0')
+    peer_interface = nb_api.dcim.interfaces.get(device_id=device_nb.id, name='wlan0')
     if peer_interface is None:
         peer_interface = nb_api.dcim.interfaces.create(
             device=device_nb.id, name='wlan0', type='other-wireless',
@@ -1051,7 +1080,7 @@ def _provision_client_device(nb_api: pynetbox.api, ap_device_nb, peer: drivers.b
     # one exists; fall back to the radio interface itself only if it
     # somehow doesn't.
     ip_interface = next(
-        (i for i in nb_api.dcim.interfaces.filter(device=device_name) if i.type.value == 'bridge'),
+        (i for i in nb_api.dcim.interfaces.filter(device_id=device_nb.id) if i.type.value == 'bridge'),
         peer_interface,
     )
 
