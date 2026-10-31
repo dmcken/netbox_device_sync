@@ -1,47 +1,49 @@
 #!/usr/bin/python3
-'''Build real NetBox L2VPN (type vpws) objects from live EoIP tunnel
-data -- the overlay-tunnel counterpart to sync_cables.py's physical
-LLDP-based cabling.
+'''Build real NetBox L2VPN objects from live EoIP tunnel data -- the
+overlay-tunnel counterpart to sync_cables.py's physical LLDP-based
+cabling.
 
 Connects to every NetBox RouterOS device, collects its EoIP tunnel
-interfaces (drivers.routeros.RouterOS.get_eoip_tunnels()), then
-correlates each tunnel's remote_address + tunnel_id against every
-other collected device's own tunnels before trusting it:
+interfaces (drivers.routeros.RouterOS.get_eoip_tunnels()), correlates
+each tunnel's remote_address + tunnel_id against every other
+collected device's own tunnels to pair up two-sided tunnels (see
+correlate_tunnels()), then GROUPS individual legs into the circuits
+they actually belong to (see group_into_circuits()):
 
-- A tunnel is "confirmed" (two-sided) only when device A reports a
-  tunnel to device B's address with tunnel-id N, AND device B
-  independently reports one back to device A's address with the same
-  tunnel-id N. remote_address alone can't pair two interfaces: a
-  device commonly runs several unrelated EoIP tunnels to the same
-  remote address (one public IP multiplexing many tunnels via
-  distinct tunnel IDs), so tunnel_id has to agree too.
-- A tunnel whose remote_address resolves to a NetBox device that
-  wasn't collected from (not RouterOS, not reachable, or simply
-  outside --netbox-device scope -- e.g. a customer's own CPE) is
-  "single-sided": only our own side is documented, same as this
-  fleet's existing customer-facing EoIP tunnels.
-- A tunnel whose remote_address resolves to a device that WAS
-  collected from, but that device reports no reciprocal tunnel back,
-  is flagged "orphaned" -- also recorded single-sided, but called out
-  separately since it's more likely stale leftover config than a
-  real one-ended tunnel (a confirmed live example: two EoIP
-  interfaces pointing at devices with no tunnel configured back at
-  all, both disabled/not running).
-- A tunnel whose remote_address doesn't resolve to any NetBox device
-  at all is "unresolved" -- recorded single-sided with the bare IP
-  noted, since there's nothing in NetBox to terminate the far end on.
-- An interface that already has an L2VPNTermination, on either end,
-  is left alone -- this script only ever fills in gaps, never touches
-  existing L2VPN data, so it's safe to re-run.
+- A plain point-to-point tunnel between two sites that each only have
+  this one leg becomes a VPWS (point-to-point) L2VPN, as before.
+- This fleet's convention for a multipoint/hub/ring circuit (e.g.
+  DAN-CE3/4/5's DAN-SVR ring to their 3 Proxmox servers, or SHP-CE1's
+  customer hub bridging several spokes) is several separate
+  point-to-point EoIP tunnels all sharing one local bridge per
+  participating router, not one actual multipoint protocol on the
+  wire -- but the *circuit* itself is multipoint, so every leg
+  touching a shared bridge merges into one VPLS L2VPN with one
+  termination per real endpoint, rather than being modeled as several
+  disconnected point-to-point objects.
+- A tunnel that isn't locally bridged at all (routed, e.g. the
+  TransGrid/NBN WAN-circuit overlays) never merges with anything --
+  each stays its own site, since there's no shared flood domain to
+  merge on.
+
+Safe to re-run: an interface already carrying an L2VPNTermination is
+never touched again, BUT a circuit that already exists in NetBox
+(found via any one of its already-terminated interfaces) and has
+grown a brand new leg since the last run gets that leg ADDED as a new
+termination on the existing L2VPN, rather than skipped or duplicated
+-- this is deliberately the common case this tool is built around:
+adding a new endpoint to an existing WAN.
 
 Defaults to a dry-run report of what it would do; pass --commit to
-actually create the L2VPNs/terminations.
+actually create/extend the L2VPNs.
 '''
 
 # System imports
 import argparse
+import collections
 import logging
 import os
+import re
 
 # External imports
 import dotenv
@@ -63,6 +65,11 @@ PLATFORM_TO_DRIVER = {
     'RouterOS': drivers.routeros.RouterOS,
 }
 
+REASON_LABELS = {
+    'orphaned': 'orphaned (no reciprocal tunnel)',
+    'unresolved': 'remote address unresolved',
+}
+
 
 def parse_arguments() -> argparse.Namespace:
     '''Parse CLI arguments.'''
@@ -80,7 +87,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         '--commit', action='store_true',
-        help="USE WITH CAUTION. Actually create the L2VPNs/terminations in "
+        help="USE WITH CAUTION. Actually create/extend the L2VPNs in "
              "NetBox. Without this, only a report is printed.",
     )
     parser.add_argument(
@@ -155,6 +162,8 @@ def correlate_tunnels(nb_api, reports):
 
     Returns (confirmed, single_sided):
     - confirmed: list of (device_a, iface_a, device_b, iface_b, tunnel_id)
+      -- iface_a/iface_b are drivers.base.EoipTunnel, not yet resolved
+      to real NetBox interfaces (see resolve_interface()).
     - single_sided: list of (device_a, iface_a, tunnel_id, remote_address,
       reason) -- reason is one of 'orphaned' (remote device was
       collected, but reports no tunnel back), 'out-of-scope' (remote
@@ -207,8 +216,8 @@ def correlate_tunnels(nb_api, reports):
 
 
 def resolve_interface(nb_api, device_nb, iface_name):
-    '''Looks up a device's interface by name. Returns None (never
-    guesses) if it's missing or ambiguous.'''
+    '''Looks up a device's interface by name, and its `bridge` field if
+    any. Returns None (never guesses) if it's missing or ambiguous.'''
     matches = list(nb_api.dcim.interfaces.filter(
         device_id=device_nb.id, name=iface_name.strip(),
     ))
@@ -217,117 +226,263 @@ def resolve_interface(nb_api, device_nb, iface_name):
     return matches[0]
 
 
+class _UnionFind:
+    '''Minimal disjoint-set over arbitrary hashable keys, used to
+    collapse individual EoIP legs into the circuits they actually
+    belong to -- see group_into_circuits().'''
+
+    def __init__(self):
+        self._parent = {}
+
+    def find(self, key):
+        self._parent.setdefault(key, key)
+        while self._parent[key] != key:
+            self._parent[key] = self._parent[self._parent[key]]
+            key = self._parent[key]
+        return key
+
+    def union(self, a, b):
+        root_a, root_b = self.find(a), self.find(b)
+        if root_a != root_b:
+            self._parent[root_a] = root_b
+
+
+def _site_of(nb_api, device, resolved_iface):
+    '''(device_id, bridge_name) identifying the local flood domain a
+    resolved NetBox interface belongs to -- the unit circuit grouping
+    actually operates on. A tunnel with no local bridge (routed, not
+    bridged) gets a key unique to itself instead, so it never merges
+    with anything -- there's no shared flood domain to merge on.
+    '''
+    if resolved_iface.bridge:
+        return (device.id, str(resolved_iface.bridge))
+    return ('unbridged', resolved_iface.id)
+
+
+def group_into_circuits(nb_api, confirmed, single_sided):
+    '''Resolves every leg's interfaces in NetBox, then collapses them
+    into the circuits they actually belong to (see this module's own
+    docstring for the merge rule). A leg whose interface doesn't
+    resolve in NetBox at all is dropped (reported separately by the
+    caller as unresolvable), same as before.
+
+    Returns a list of circuits: {'type': 'vpws' | 'vpls',
+    'members': [(device, interface), ...], 'tunnel_id': int | None,
+    'reasons': Counter} -- members is already deduplicated by
+    interface id (a device can touch a circuit via more than one leg,
+    e.g. DAN-CE4 in the DAN-SVR ring).
+    '''
+    resolved_confirmed = []
+    resolved_single = []
+    unresolvable = []
+
+    for device_a, iface_a, device_b, iface_b, tunnel_id in confirmed:
+        resolved_a = resolve_interface(nb_api, device_a, iface_a)
+        resolved_b = resolve_interface(nb_api, device_b, iface_b)
+        if resolved_a is None:
+            unresolvable.append(f"{device_a.name}/{iface_a}")
+        if resolved_b is None:
+            unresolvable.append(f"{device_b.name}/{iface_b}")
+        if resolved_a is None or resolved_b is None:
+            continue
+        resolved_confirmed.append((device_a, resolved_a, device_b, resolved_b, tunnel_id))
+
+    for device_a, iface_a, tunnel_id, remote_address, reason in single_sided:
+        resolved_a = resolve_interface(nb_api, device_a, iface_a)
+        if resolved_a is None:
+            unresolvable.append(f"{device_a.name}/{iface_a}")
+            continue
+        resolved_single.append((device_a, resolved_a, tunnel_id, remote_address, reason))
+
+    uf = _UnionFind()
+    site_legs = collections.defaultdict(list)  # site -> [('confirmed'|'single', idx)]
+
+    for idx, (device_a, iface_a, device_b, iface_b, tunnel_id) in enumerate(resolved_confirmed):
+        site_a = _site_of(nb_api, device_a, iface_a)
+        site_b = _site_of(nb_api, device_b, iface_b)
+        uf.union(site_a, site_b)
+        site_legs[site_a].append(('confirmed', idx))
+        if site_b != site_a:
+            site_legs[site_b].append(('confirmed', idx))
+
+    for idx, (device_a, iface_a, tunnel_id, remote_address, reason) in enumerate(resolved_single):
+        site_a = _site_of(nb_api, device_a, iface_a)
+        site_legs[site_a].append(('single', idx))
+
+    circuits_by_root = collections.defaultdict(set)
+    for site, entries in site_legs.items():
+        root = uf.find(site)
+        for kind, idx in entries:
+            circuits_by_root[root].add((kind, idx))
+
+    circuits = []
+    for idents in circuits_by_root.values():
+        confirmed_members = sorted({i for kind, i in idents if kind == 'confirmed'})
+        single_members = sorted({i for kind, i in idents if kind == 'single'})
+        leg_count = len(confirmed_members) + len(single_members)
+
+        members = {}  # interface id -> (device, interface)
+        for i in confirmed_members:
+            device_a, iface_a, device_b, iface_b, _ = resolved_confirmed[i]
+            members[iface_a.id] = (device_a, iface_a)
+            members[iface_b.id] = (device_b, iface_b)
+        for i in single_members:
+            device_a, iface_a, _, _, _ = resolved_single[i]
+            members[iface_a.id] = (device_a, iface_a)
+
+        reasons = collections.Counter(
+            resolved_single[i][4] for i in single_members if resolved_single[i][4] in REASON_LABELS
+        )
+
+        tunnel_id = None
+        if leg_count == 1:
+            tunnel_id = (
+                resolved_confirmed[confirmed_members[0]][4] if confirmed_members
+                else resolved_single[single_members[0]][2]
+            )
+
+        circuits.append({
+            'type': 'vpls' if leg_count > 1 else 'vpws',
+            'members': list(members.values()),
+            'tunnel_id': tunnel_id,
+            'reasons': reasons,
+        })
+
+    return circuits, unresolvable
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9]+', '-', text).strip('-').lower()[:100]
+
+
+def _circuit_name(circuit):
+    '''Best name for a circuit.
+
+    Exactly 2 members (VPWS, whether bridged or routed) is always
+    named by its device pair, with the bridge name (if any) just a
+    parenthetical note -- never by bridge name alone, since this
+    fleet reuses generic local bridge names (above all "trunk", a
+    router's own main VLAN bridge) completely independently across
+    unrelated routers. Naming purely by a shared bridge name would
+    collide two completely unrelated point-to-point circuits onto the
+    one display name (and the one NetBox slug).
+
+    A real multipoint circuit (3+ members) is named by the one bridge
+    name shared across every member, if there is one -- this really
+    is this fleet's own convention for a multipoint circuit (e.g.
+    "DAN-SVR", "virtual-customers": the same bridge name, deliberately
+    reused, on every participating router) -- else by the hub
+    device/bridge (whichever site has the most members touching it,
+    e.g. SHP-CE1's customer hub, where each spoke's own local bridge
+    is named differently from SHP-CE1's and from each other).
+    '''
+    names = sorted({device.name for device, _ in circuit['members']})
+    suffix = f" (id {circuit['tunnel_id']})" if circuit['tunnel_id'] is not None else ""
+
+    if len(circuit['members']) == 2:
+        bridges = {str(iface.bridge) for _, iface in circuit['members'] if iface.bridge}
+        note = f" ({next(iter(bridges))})" if len(bridges) == 1 else ""
+        return f"EoIP: {names[0]} <-> {names[1]}{note}{suffix}"
+
+    bridge_names = {str(iface.bridge) for _, iface in circuit['members'] if iface.bridge}
+    if len(bridge_names) == 1:
+        return f"EoIP: {next(iter(bridge_names))}"
+
+    site_counts = collections.Counter(
+        (device.name, str(iface.bridge)) for device, iface in circuit['members'] if iface.bridge
+    )
+    if site_counts:
+        (device_name, bridge_name), _ = site_counts.most_common(1)[0]
+        return f"EoIP: {device_name}/{bridge_name} hub"
+
+    return f"EoIP: {', '.join(names)}{suffix}"
+
+
+def _circuit_description(circuit):
+    notes = [f"{count} {REASON_LABELS[reason]}" for reason, count in circuit['reasons'].items()]
+    return '; '.join(notes)
+
+
+def _find_existing_l2vpn(nb_api, members):
+    '''If any member interface in this circuit already has an
+    L2VPNTermination, return that termination's L2VPN -- this circuit
+    already exists in NetBox (fully or partially), so a brand new
+    member found this run should be ADDED to it, not create a
+    duplicate L2VPN. None if nothing in this circuit has ever synced.
+    '''
+    for _, iface in members:
+        existing = list(nb_api.vpn.l2vpn_terminations.filter(
+            assigned_object_type='dcim.interface', assigned_object_id=iface.id,
+        ))
+        if existing:
+            return existing[0].l2vpn
+    return None
+
+
 def _already_terminated(nb_api, interface) -> bool:
-    '''True if this interface already has an L2VPNTermination -- the
-    idempotency check that makes re-running this script safe (never
-    creates a second L2VPN over the same tunnel interface).'''
     existing = list(nb_api.vpn.l2vpn_terminations.filter(
         assigned_object_type='dcim.interface', assigned_object_id=interface.id,
     ))
     return bool(existing)
 
 
-def _l2vpn_name(device_a, device_b=None, label=None, tunnel_id=None):
-    '''Human-readable, globally-unique L2VPN name. tunnel_id is always
-    appended (not just when a collision happens) -- two independent
-    tunnels between the exact same device pair, each with their own
-    ID, are a real and already-confirmed-live configuration (DAN-CE4
-    <-> DAN-CE5 runs both a DAN-SVR mesh leg and a separate full-trunk
-    extension), so a name built from the device pair alone isn't
-    actually unique.'''
-    suffix = f" (id {tunnel_id})" if tunnel_id is not None else ""
-    if device_b is not None:
-        return f"EoIP: {device_a.name} <-> {device_b.name}" + (f" ({label})" if label else "") + suffix
-    return f"EoIP: {device_a.name}" + (f" ({label})" if label else "") + suffix
-
-
-def _slugify(text: str) -> str:
-    import re
-    return re.sub(r'[^a-zA-Z0-9]+', '-', text).strip('-').lower()[:100]
-
-
-def apply_confirmed(nb_api, confirmed, commit: bool):
-    '''Reports (and, if commit, creates) one vpws L2VPN per confirmed
-    two-sided tunnel pair, skipping either interface that's already
-    terminated.'''
+def apply_circuits(nb_api, circuits, commit: bool):
+    '''Reports (and, if commit, creates/extends) one L2VPN per circuit.
+    A circuit already (fully or partially) in NetBox gets any new
+    member added as a new termination on the existing L2VPN -- the
+    common case this tool is built around: adding a new endpoint to
+    an existing WAN, not creating a parallel one.
+    '''
     created = 0
-    for device_a, iface_a_name, device_b, iface_b_name, tunnel_id in confirmed:
-        iface_a = resolve_interface(nb_api, device_a, iface_a_name)
-        iface_b = resolve_interface(nb_api, device_b, iface_b_name)
-        label = f"{device_a.name}/{iface_a_name} <-> {device_b.name}/{iface_b_name} (id={tunnel_id})"
+    extended = 0
+    for circuit in circuits:
+        label = _circuit_name(circuit)
+        existing_l2vpn = _find_existing_l2vpn(nb_api, circuit['members'])
+        new_members = [
+            (device, iface) for device, iface in circuit['members']
+            if not _already_terminated(nb_api, iface)
+        ]
 
-        if iface_a is None or iface_b is None:
-            print(f"SKIP (interface not found in NetBox)  {label}")
-            continue
-        if _already_terminated(nb_api, iface_a) or _already_terminated(nb_api, iface_b):
-            print(f"SKIP (already synced)                 {label}")
+        if existing_l2vpn is not None:
+            if not new_members:
+                print(f"SKIP (already fully synced)                 {label}")
+                continue
+            member_desc = ', '.join(f"{d.name}/{i.name}" for d, i in new_members)
+            if not commit:
+                print(f"WOULD ADD {len(new_members)} endpoint(s) to '{existing_l2vpn.name}': {member_desc}")
+                continue
+            try:
+                for device, iface in new_members:
+                    nb_api.vpn.l2vpn_terminations.create(
+                        l2vpn=existing_l2vpn.id, assigned_object_type='dcim.interface',
+                        assigned_object_id=iface.id,
+                    )
+                print(f"ADDED {len(new_members)} endpoint(s) to '{existing_l2vpn.name}': {member_desc}")
+                extended += 1
+            except pynetbox.RequestError as exc:
+                print(f"FAILED to extend '{existing_l2vpn.name}' ({exc}): {member_desc}")
             continue
 
+        # Brand new circuit.
+        member_desc = ', '.join(f"{d.name}/{i.name}" for d, i in circuit['members'])
         if not commit:
-            print(f"WOULD CREATE                          {label}")
+            print(f"WOULD CREATE ({circuit['type']}, {len(circuit['members'])} endpoint(s))  {label}: {member_desc}")
             continue
-
         try:
-            name = _l2vpn_name(device_a, device_b, tunnel_id=tunnel_id)
             l2vpn = nb_api.vpn.l2vpns.create(
-                name=name, slug=_slugify(name), type='vpws', identifier=tunnel_id,
+                name=label, slug=_slugify(label), type=circuit['type'],
+                identifier=circuit['tunnel_id'], description=_circuit_description(circuit),
             )
-            nb_api.vpn.l2vpn_terminations.create(
-                l2vpn=l2vpn.id, assigned_object_type='dcim.interface', assigned_object_id=iface_a.id,
-            )
-            nb_api.vpn.l2vpn_terminations.create(
-                l2vpn=l2vpn.id, assigned_object_type='dcim.interface', assigned_object_id=iface_b.id,
-            )
-            print(f"CREATED                                {label}")
+            for device, iface in circuit['members']:
+                nb_api.vpn.l2vpn_terminations.create(
+                    l2vpn=l2vpn.id, assigned_object_type='dcim.interface', assigned_object_id=iface.id,
+                )
+            print(f"CREATED ({circuit['type']}, {len(circuit['members'])} endpoint(s))  {label}: {member_desc}")
             created += 1
         except pynetbox.RequestError as exc:
-            print(f"FAILED ({exc})                        {label}")
+            print(f"FAILED ({exc})  {label}")
 
-    return created
-
-
-def apply_single_sided(nb_api, single_sided, commit: bool):
-    '''Reports (and, if commit, creates) one vpws L2VPN per single-sided
-    tunnel, with one termination (our own side only) and a description
-    recording why the far side wasn't resolved.'''
-    created = 0
-    for device_a, iface_a_name, tunnel_id, remote_address, reason in single_sided:
-        iface_a = resolve_interface(nb_api, device_a, iface_a_name)
-        label = f"{device_a.name}/{iface_a_name} -> {remote_address} (id={tunnel_id}, {reason})"
-
-        if iface_a is None:
-            print(f"SKIP (interface not found in NetBox)  {label}")
-            continue
-        if _already_terminated(nb_api, iface_a):
-            print(f"SKIP (already synced)                 {label}")
-            continue
-
-        if not commit:
-            print(f"WOULD CREATE (single-sided, {reason:11s}) {label}")
-            continue
-
-        descriptions = {
-            'unresolved': f"Remote address {remote_address} doesn't match any NetBox device/interface.",
-            'out-of-scope': f"Remote address {remote_address} resolves to a NetBox device not collected "
-                             "from this run (not RouterOS, unreachable, or out of --netbox-device scope).",
-            'orphaned': f"Remote address {remote_address} resolves to a collected device with no "
-                        "reciprocal EoIP tunnel -- likely stale config, worth a manual check.",
-        }
-        try:
-            name = _l2vpn_name(device_a, label=str(remote_address), tunnel_id=tunnel_id)
-            l2vpn = nb_api.vpn.l2vpns.create(
-                name=name, slug=_slugify(name), type='vpws', identifier=tunnel_id,
-                description=descriptions[reason],
-            )
-            nb_api.vpn.l2vpn_terminations.create(
-                l2vpn=l2vpn.id, assigned_object_type='dcim.interface', assigned_object_id=iface_a.id,
-            )
-            print(f"CREATED (single-sided, {reason:11s})  {label}")
-            created += 1
-        except pynetbox.RequestError as exc:
-            print(f"FAILED ({exc})                        {label}")
-
-    return created
+    return created, extended
 
 
 def main():
@@ -349,24 +504,26 @@ def main():
 
     reports = collect_eoip_reports(nb_api, device_credentials, args.netbox_device)
     confirmed, single_sided = correlate_tunnels(nb_api, reports)
+    circuits, unresolvable = group_into_circuits(nb_api, confirmed, single_sided)
 
-    orphaned = [s for s in single_sided if s[4] == 'orphaned']
-    out_of_scope = [s for s in single_sided if s[4] == 'out-of-scope']
-    unresolved = [s for s in single_sided if s[4] == 'unresolved']
-
-    print(f"\n{len(confirmed)} confirmed (two-sided) tunnel(s), "
-          f"{len(single_sided)} single-sided "
-          f"({len(out_of_scope)} out-of-scope, {len(orphaned)} orphaned, "
-          f"{len(unresolved)} unresolved).\n")
+    vpws_count = sum(1 for c in circuits if c['type'] == 'vpws')
+    vpls_count = sum(1 for c in circuits if c['type'] == 'vpls')
+    print(f"\n{len(circuits)} circuit(s): {vpws_count} point-to-point (VPWS), "
+          f"{vpls_count} multipoint (VPLS). {len(unresolvable)} leg(s) couldn't "
+          f"be resolved to a NetBox interface at all.\n")
 
     if not args.commit:
-        print("--- DRY RUN (pass --commit to actually create L2VPNs) ---")
+        print("--- DRY RUN (pass --commit to actually create/extend L2VPNs) ---")
 
-    created = apply_confirmed(nb_api, confirmed, args.commit)
-    created += apply_single_sided(nb_api, single_sided, args.commit)
+    created, extended = apply_circuits(nb_api, circuits, args.commit)
+
+    if unresolvable:
+        print("\n--- Interfaces not found in NetBox (device-sync gap, not this tool's job) ---")
+        for entry in unresolvable:
+            print(f"  {entry}")
 
     if args.commit:
-        print(f"\nCreated {created} L2VPN(s).")
+        print(f"\nCreated {created} new L2VPN(s), extended {extended} existing one(s).")
 
 
 if __name__ == "__main__":
