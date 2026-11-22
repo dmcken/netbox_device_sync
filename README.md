@@ -220,3 +220,129 @@ logged as an unresolved peer:
   link-local/loopback ranges ignored everywhere else in this tool are
   skipped here too) - then treated exactly like a normally-resolved
   peer from there on (associated with the `WirelessLAN`, etc).
+
+## Proxmox sync (`sync_proxmox.py`)
+
+Models Proxmox VE clusters in NetBox: each guest (QEMU VM or LXC container,
+templates skipped) becomes a NetBox virtual machine with its host node, status,
+vCPUs, memory, SMBIOS UUID (serial), virtual disks, interfaces + MACs, guest IPs
+and a primary IPv4. **Proxmox is authoritative** for every cluster the sync is
+enabled on.
+
+```
+.venv/bin/python sync_proxmox.py --dry-run          # print every change, write nothing
+.venv/bin/python sync_proxmox.py                     # all clusters with proxmox_sync_enabled
+.venv/bin/python sync_proxmox.py -c DC1-Internal     # one cluster
+```
+
+### Per-cluster configuration (NetBox)
+
+Custom fields on the NetBox **cluster** (group "Proxmox sync"):
+
+| Field | Example | |
+|---|---|---|
+| `proxmox_sync_enabled` | true | include the cluster in runs |
+| `proxmox_token_id` | `netbox@pve!sync` | |
+| `proxmox_verify_tls` | false | false for self-signed node certificates |
+| `proxmox_node_map` | `pve1=DC-DC1-PVE001,...` | optional, when node names don't match the NetBox devices |
+
+There is no API URL to configure: the sync tries the **primary IP of each
+device in the NetBox cluster** (port 8006, active devices first) and uses the
+first node that answers, so any node being down is fine.
+
+**Onboarding a cluster:** create the cluster in NetBox, add one of its hosts
+(device) to it with a primary IP, set `proxmox_token_id` and
+`proxmox_sync_enabled`, add the secret below, and run `--dry-run`.
+
+The token **secret** is not stored in NetBox (custom fields are readable by
+every NetBox user). Put it in `.env` as `PVE_TOKEN_SECRET_<CLUSTER>`: the NetBox
+cluster name upper-cased, non-alphanumerics replaced by `_`
+(`DC1-Internal` -> `PVE_TOKEN_SECRET_DC1_INTERNAL`).
+
+Each VM also gets a `proxmox_vmid` custom field; the sync matches on it.
+
+### Proxmox user and permissions (per cluster)
+
+Run on any node of the cluster as root:
+
+```
+pveum user add netbox@pve --comment "NetBox sync"
+pveum acl modify / --users netbox@pve --roles PVEAuditor
+pveum role add NetBoxGuestAgent --privs "VM.Monitor"
+pveum acl modify / --users netbox@pve --roles NetBoxGuestAgent
+pveum user token add netbox@pve sync --privsep 0      # secret is shown once
+```
+
+`PVEAuditor` covers nodes, guests, configs and disks. **Guest IPs and OS**
+come from the QEMU guest agent (`agent/network-get-interfaces`,
+`agent/get-osinfo`), which on **Proxmox 8 requires `VM.Monitor`**. Be aware
+that `VM.Monitor` also allows QEMU monitor commands on every VM, so this token
+is not strictly read-only: keep the secret only in `.env` (mode 600). On
+**Proxmox 9** replace `VM.Monitor` with `VM.GuestAgent.Audit`, which is
+read-only. Without either, the sync still runs but VMs get no IPs, primary IP
+or platform (the log warns "permission denied ... guest-agent calls").
+VMs without the guest agent installed/enabled never get IPs.
+
+### Hardware inventory (node serials, device types, iDRAC/iLO)
+
+The Proxmox API has no DMI data, so for each node the sync also runs a fixed,
+read-only command over SSH: `dmidecode` (manufacturer, model, service tag, BIOS)
+and `ipmitool lan print 1` (BMC IP, mask, MAC). From that it sets:
+
+- the device **serial** (Dell service tag);
+- the **device type**, but only on nodes the sync created (description starts
+  "Created by sync_proxmox.py") and on "Generic ..." placeholders. Any other
+  mismatch, or a model with no device type in NetBox, is a warning; import
+  missing types from the devicetype-library rather than creating them by hand;
+- the BMC interface (`iDRAC` / `iLO`, mgmt-only, created if missing) **MAC and
+  IP**, and the device's **out-of-band IP**.
+
+Access is a dedicated key (`~/.ssh/netbox_pve_inventory` on netbox001, override
+with `PVE_SSH_KEY`). Print the line for a cluster with:
+
+```
+.venv/bin/python sync_proxmox.py --print-authorized-keys 172.16.17.10
+```
+
+and append it, once per cluster, to `/etc/pve/priv/authorized_keys` on any node.
+That file is shared across the cluster (root's `authorized_keys` on every
+node), so nodes added later get it automatically. The line is locked down:
+`from="172.16.17.10"` (netbox001 only), `restrict` (no shell, PTY or
+forwarding) and `command=` (the node runs only the inventory command, whatever
+is requested). For BMC details `ipmitool` must be installed on each node
+(`apt install ipmitool`); without it only serial and model are read.
+
+Host keys are pinned on first contact in `~/.ssh/known_hosts_proxmox`. If a
+node is rebuilt, remove its entry there. Nodes the key can't reach are a
+warning; the rest of the sync still runs.
+
+### Behaviour
+
+- **Nodes are discovered from the Proxmox cluster membership** (`/cluster/status`).
+  Each is matched to a NetBox device: in the cluster by name (or
+  `proxmox_node_map`), else by name anywhere in NetBox if that device has no
+  cluster (it is moved into this one). A same-named device in a *different*
+  cluster is never moved; that is a warning.
+- **Missing nodes are created**, named as in Proxmox, copying device type,
+  role, site, location, platform and tenant from the host the sync connected
+  through. Fix the device type afterwards if that node is different hardware;
+  the sync never changes it again.
+- A node device without a primary IP gets the node's **cluster IP** on the
+  node interface that carries it (e.g. `vmbr0.20`), created on the device if
+  needed. Every node then has a primary IP, so the API connection fails over
+  to any node that is up.
+- NetBox VMs in the cluster **without `proxmox_vmid` are deleted** (hand-made
+  entries), as are VMs whose VMID no longer exists in Proxmox, with their
+  interfaces, MACs and IPs. Deletes run before creates. A deleted hand-made
+  VM's `zabbix_hostid` and tags carry over to a new VM of the same name, so
+  netbox-zabbix-sync keeps tracking the host instead of logging "host already
+  present".
+- Interfaces, disks and IPs on synced VMs that Proxmox/the guest no longer
+  reports are removed. A MAC or IP already assigned to some other NetBox object
+  is never taken over; it's reported as a warning.
+- Primary IPv4 prefers a private (RFC 1918) address, so LAN monitoring reaches
+  it. Platform is only set when blank (from the guest OS).
+- Stopped guests become **Offline** (netbox-zabbix-sync disables, not deletes,
+  the Zabbix host).
+- Safety stops: nothing is deleted if any Proxmox API listing failed, Proxmox
+  returned no guests, or more than 20% of a cluster's VMID-matched VMs would go.
