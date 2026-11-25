@@ -11,6 +11,7 @@ import librouteros
 # Local import
 import drivers.base
 from drivers._routeros_rest import RestDevice, RestError
+from drivers._routeros_ssh import SshAuthError, SshDevice, SshError
 
 logger = logging.getLogger(__name__)
 
@@ -62,20 +63,35 @@ class RouterOS(drivers.base.DriverBase):
             self._dev = self._connect_rest(**kwargs)
 
     @staticmethod
-    def _connect_rest(**kwargs) -> RestDevice:
-        """Connect over the REST API instead - see drivers._routeros_rest.
+    def _connect_rest(**kwargs) -> RestDevice | SshDevice:
+        """Connect over the REST API instead - see drivers._routeros_rest -
+        and, where that is switched off as well, over SSH - see
+        drivers._routeros_ssh.
 
         Raises:
-            drivers.base.AuthenticationError: REST rejected the credentials.
-            drivers.base.ConnectError: REST unreachable too.
+            drivers.base.AuthenticationError: the device rejected the
+                credentials.
+            drivers.base.ConnectError: neither REST nor SSH is reachable.
         """
         dev = RestDevice(kwargs['host'], kwargs['username'], kwargs['password'])
         try:
             dev.get('system/identity')  # cheap probe, so failures surface here
+            return dev
         except RestError as exc:
             if '401' in str(exc):
                 raise drivers.base.AuthenticationError() from exc
-            raise drivers.base.ConnectError(str(exc)) from exc
+            rest_error = exc
+
+        logger.info(
+            f"RouterOS REST unavailable on {kwargs['host']}, trying SSH"
+        )
+        try:
+            dev = SshDevice(kwargs['host'], kwargs['username'], kwargs['password'])
+            dev.get('system/identity')  # proves :serialize works on this version
+        except SshAuthError as exc:
+            raise drivers.base.AuthenticationError() from exc
+        except SshError as exc:
+            raise drivers.base.ConnectError(f"{rest_error}; {exc}") from exc
         return dev
 
     def _close(self,) -> None:
@@ -275,27 +291,36 @@ class RouterOS(drivers.base.DriverBase):
                 res_neighbours.append(neighbour_rec)
 
         # LLDP is handled separately from the generic map-driven loop
-        # above: RouterOS's '/ip/neighbor' table also surfaces CDP/MNDP
-        # neighbours discovered over virtual links (EoIP tunnels, VPN
-        # peers) - those aren't physical connections and must never be
-        # mistaken for one, so only entries RouterOS attributes to LLDP
-        # alone are kept (discovered-by is a comma-joined list of every
-        # protocol that saw the neighbour; a mixed 'cdp,lldp' value seen
-        # in practice on tunnel interfaces means LLDP is riding the
-        # virtual link too, not that there's a real cable). The
-        # 'interface' field is itself a comma-joined list (the physical
-        # port, then any bridge/bond it's a member of) - only the first,
-        # physical entry is kept, since a Cable terminates on a real
-        # port, not a bridge.
+        # above. RouterOS's '/ip/neighbor' table mixes LLDP, CDP and MNDP
+        # and lists a neighbour once per interface it was heard on -
+        # including bridges, VLANs and tunnels (EoIP, VPN peers), which
+        # are not physical connections. Only entries that LLDP itself saw
+        # are kept ('discovered-by' is a comma-joined list of every
+        # protocol that saw the neighbour: 'lldp' for a Juniper/Cisco
+        # peer, 'cdp,lldp,mndp' for another MikroTik on a real port), and
+        # the caller is told which local interface it was, so it can
+        # discard the ones that turn out not to be a physical port (see
+        # sync_cables.py). The 'interface' field is itself a comma-joined
+        # list (the physical port, then any bridge/bond it's a member
+        # of) - only the first, physical entry is kept, since a Cable
+        # terminates on a real port, not a bridge.
+        #
+        # 'interface-name' is the neighbour's own port as it advertised
+        # it: its real port name from another MikroTik (prefixed with the
+        # bridge/bond it sits in, e.g. 'bond_PTN-CE1/sfp-sfpplus5'), but
+        # only a free-text description from most Juniper switches. It is
+        # passed on as a hint; whether it names a real port is for the
+        # caller to check against the neighbour's own interface list.
         for entry in self._dev.path('ip', 'neighbor'):
-            if entry.get('discovered-by') != 'lldp':
+            discovered_by = str(entry.get('discovered-by') or '').split(',')
+            if 'lldp' not in discovered_by:
                 continue
             identity = entry.get('identity')
             if not identity:
                 continue
 
             mac = [entry['mac-address']] if entry.get('mac-address') else []
-            local_interface = entry.get('interface', '').split(',')[0] or None
+            local_interface = str(entry.get('interface') or '').split(',')[0] or None
 
             res_neighbours.append(drivers.base.Neighbour(
                 mac=mac,

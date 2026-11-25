@@ -76,20 +76,40 @@ class JunOS(drivers.base.DriverBase):
 
 
     def _connect(self, **kwargs):
+        '''Open a NETCONF session to the device.
+
+        Tries the dedicated NETCONF port (830) first. Many devices here
+        only run plain SSH, so if that port is closed or unreachable the
+        session is retried over port 22, where PyEZ starts NETCONF from
+        the CLI itself and needs no extra service enabled.
         '''
-        '''
+        logger.debug(f"Attempting to connect to JunOS device: {kwargs.get('host')}")
+        kwargs['gather_facts'] = True
+
         try:
-            logger.debug("Attempting to connect to JunOS device: {0}".format(kwargs))
-
-            kwargs['gather_facts'] = True
-
             self._dev = jnpr.junos.Device(**kwargs)
             self._dev.open(normalize=True)
+            return
+        except jnpr.junos.exception.ConnectAuthError as e:
+            raise drivers.base.AuthenticationError(str(e)) from e
         except jnpr.junos.exception.ConnectError as e:
-            raise drivers.base.ConnectError() from e
+            if 'port' in kwargs:
+                raise drivers.base.ConnectError(str(e)) from e
+            logger.info(
+                f"NETCONF port unavailable on {kwargs.get('host')} ({e!r}), "
+                "trying NETCONF over SSH port 22"
+            )
         except Exception as e:
             logger.error("General connection error: {0}".format(e))
             raise e from e
+
+        try:
+            self._dev = jnpr.junos.Device(port=22, **kwargs)
+            self._dev.open(normalize=True)
+        except jnpr.junos.exception.ConnectAuthError as e:
+            raise drivers.base.AuthenticationError(str(e)) from e
+        except jnpr.junos.exception.ConnectError as e:
+            raise drivers.base.ConnectError(str(e)) from e
 
     def _close(self,):
         try:
@@ -383,14 +403,17 @@ class JunOS(drivers.base.DriverBase):
     def get_neighbours(self,) -> list[drivers.base.Neighbour]:
         """Get LLDP neighbours to this device.
 
-        Only the local port id is authoritative here - the remote port
-        is exposed by Junos as a free-text *description* someone
-        configured on that port, not its actual port ID (e.g. it can
-        read "DC1-SPINE1-B4_xe-0/0/43" for a neighbour actually named
-        "DC1-ToR-A9-1" - a stale/unrelated label, not the port name).
-        It's kept in remote_interface as a best-effort hint only; the
-        caller must confirm it against the neighbour's own reported
-        local port before trusting it for anything like Cable creation.
+        The local port id is authoritative. The remote port is only as
+        good as what the neighbour advertised: when its LLDP port ID is
+        of subtype "Interface name" (MikroTik, Cisco NX-OS, Arista...)
+        that is the neighbour's real port name and is returned with
+        remote_interface_is_port_id set. Otherwise (another Juniper
+        usually sends a locally assigned number) the only text available
+        is the free-text *description* configured on that port (e.g. it
+        can read "DC1-SPINE1-B4_xe-0/0/43" for a neighbour actually named
+        "DC1-ToR-A9-1" - a stale/unrelated label, not the port name),
+        kept as a best-effort hint the caller must confirm against the
+        neighbour's own reported local port before trusting it.
         """
         res_neighbours = []
 
@@ -416,11 +439,19 @@ class JunOS(drivers.base.DriverBase):
             if chassis_id and 'mac' in chassis_id_subtype.lower():
                 mac.append(chassis_id)
 
+            port_id = entry.get('lldp-remote-port-id')
+            port_id_subtype = (entry.get('lldp-remote-port-id-subtype') or '').lower()
+            is_port_id = bool(port_id) and port_id_subtype == 'interface name'
+
             res_neighbours.append(drivers.base.Neighbour(
                 mac=mac,
                 name=remote_name,
                 interface=entry.get('lldp-local-port-id'),
-                remote_interface=entry.get('lldp-remote-port-description'),
+                remote_interface=(
+                    port_id if is_port_id
+                    else entry.get('lldp-remote-port-description')
+                ),
+                remote_interface_is_port_id=is_port_id,
                 source='LLDP',
             ))
 
