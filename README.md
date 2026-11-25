@@ -331,6 +331,12 @@ warning; the rest of the sync still runs.
   node interface that carries it (e.g. `vmbr0.20`), created on the device if
   needed. Every node then has a primary IP, so the API connection fails over
   to any node that is up.
+- **Guests tagged `netbox-skip` in Proxmox are left out entirely**: never
+  created, updated or deleted, and neither is a NetBox VM holding their VMID or
+  a hand-made VM of the same name. Use it for guests modelled another way in
+  NetBox, e.g. firewall VMs kept as NetBox *devices* so their interfaces, CARP
+  groups and Oxidized backups stay hand-curated. Add the tag in Proxmox
+  (guest > Summary > Tags); each run logs the guests it skipped.
 - NetBox VMs in the cluster **without `proxmox_vmid` are deleted** (hand-made
   entries), as are VMs whose VMID no longer exists in Proxmox, with their
   interfaces, MACs and IPs. Deletes run before creates. A deleted hand-made

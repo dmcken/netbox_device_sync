@@ -29,6 +29,10 @@ Proxmox is authoritative for each synced cluster's virtual machines:
   the sync connected through. A node device without a primary IP gets the
   node's cluster IP, on the matching interface (e.g. vmbr0), so the sync can
   reach the API through any node.
+- Guests tagged SKIP_TAG ("netbox-skip") in Proxmox are left alone: never
+  created, updated or deleted, nor is a NetBox VM holding their VMID or a
+  hand-made VM of the same name. Use it for guests modelled another way in
+  NetBox (e.g. firewalls kept as devices).
 - VMs (QEMU and LXC; templates skipped) are matched on the proxmox_vmid custom
   field. Missing ones are created; all get status, host node, vCPUs, memory,
   SMBIOS UUID (serial), virtual disks, interfaces + MACs, guest-agent IPs and a
@@ -65,6 +69,7 @@ LOGGING_FORMAT = '%(asctime)s %(levelname)s %(message)s'
 
 MAX_DELETE_FRACTION = 0.2
 CF_VMID = 'proxmox_vmid'
+SKIP_TAG = 'netbox-skip'   # Proxmox guest tag: leave this guest out of the sync entirely
 CF_ZABBIX = 'zabbix_hostid'
 DISK_KEY_RE = re.compile(r'^(scsi|virtio|sata|ide)\d+$')
 LXC_DISK_KEY_RE = re.compile(r'^(rootfs|mp\d+)$')
@@ -134,6 +139,11 @@ class Proxmox:
             else:
                 logger.debug(f'Proxmox API {path} unavailable: {status or exc}')
             return None
+
+
+def guest_tags(res: dict) -> set:
+    '''Proxmox guest tags (";"-separated in /cluster/resources), lower-cased.'''
+    return {t for t in re.split(r'[;,\s]+', str(res.get('tags') or '').lower()) if t}
 
 
 def size_to_mb(text: str) -> int:
@@ -699,9 +709,13 @@ class ClusterSync:
             return False
         pve_name = next((s.get('name') for s in status if s.get('type') == 'cluster'), '(standalone)')
         nodes = sorted((s for s in status if s.get('type') == 'node'), key=lambda n: n['name'])
-        guests = sorted((r for r in resources if not r.get('template')), key=lambda r: r['vmid'])
+        all_guests = sorted((r for r in resources if not r.get('template')), key=lambda r: r['vmid'])
+        skipped = [g for g in all_guests if SKIP_TAG in guest_tags(g)]
+        guests = [g for g in all_guests if g not in skipped]
+        for g in skipped:
+            logger.info(f"[{self.cluster.name}] skipping {g.get('name')} (vmid {g['vmid']}): tagged {SKIP_TAG}")
         logger.info(f"[{self.cluster.name}] Proxmox {version.get('version', '?')} cluster {pve_name}: "
-                    f"{len(nodes)} nodes, {len(guests)} guests")
+                    f"{len(nodes)} nodes, {len(all_guests)} guests ({len(skipped)} tagged {SKIP_TAG})")
         node_devs = self.ensure_nodes(nodes, node_map)
         platforms = {p.slug: p for p in self.nb.dcim.platforms.all()}
 
@@ -717,14 +731,17 @@ class ClusterSync:
                 unmanaged.append(v)
             else:
                 by_vmid[vmid] = v
-        pve_vmids = {g['vmid'] for g in guests}
+        # Skipped guests still count as present, so a NetBox VM holding their VMID is not "gone".
+        pve_vmids = {g['vmid'] for g in all_guests}
         gone = [v for vmid, v in by_vmid.items() if vmid not in pve_vmids]
+        skip_names = {str(g.get('name', '')).lower() for g in skipped}
+        unmanaged = [v for v in unmanaged if v.name.lower() not in skip_names]
 
         # Deletes first, so their IPs/MACs are free for the creates below.
         blockers = []
         if self.pve.errors:
             blockers.append(f'{len(self.pve.errors)} Proxmox API error(s)')
-        if not guests:
+        if not all_guests:
             blockers.append('Proxmox returned no guests')
         if len(gone) > MAX_DELETE_FRACTION * max(len(by_vmid), 1) and len(gone) > 1:
             blockers.append(f'{len(gone)} of {len(by_vmid)} VMID-matched VMs would be deleted (> {MAX_DELETE_FRACTION:.0%})')
