@@ -231,10 +231,15 @@ def fill_guest_ips(pve: Proxmox, vm: dict, cfg: dict):
         osinfo = pve.get(f"/nodes/{vm['node']}/qemu/{vm['vmid']}/agent/get-osinfo", required=False)
         if osinfo:
             vm['ostype'] = (osinfo.get('result') or {}).get('id')
-        if not data:
+        result = data.get('result') if isinstance(data, dict) else None
+        if not isinstance(result, list):   # agent not answering / error object: leave the guest's IPs alone
+            if data:
+                logger.debug(f"vm {vm['vmid']}: unexpected guest-agent reply {str(data)[:200]}")
             return
         vm['ips_known'] = True
-        for gi in (data.get('result') or []):
+        for gi in result:
+            if not isinstance(gi, dict):
+                continue
             name, mac = gi.get('name', ''), (gi.get('hardware-address') or '').upper()
             nic = by_mac.get(mac)
             if nic is None or SKIP_GUEST_IFACES.match(name):
@@ -244,10 +249,12 @@ def fill_guest_ips(pve: Proxmox, vm: dict, cfg: dict):
                 _add_ip(nic, a.get('ip-address'), a.get('prefix'))
     else:
         data = pve.get(f"/nodes/{vm['node']}/lxc/{vm['vmid']}/interfaces", required=False)
-        if not data:
+        if not isinstance(data, list):
             return
         vm['ips_known'] = True
         for gi in data:
+            if not isinstance(gi, dict):
+                continue
             nic = by_mac.get((gi.get('hwaddr') or '').upper())
             if nic is None:
                 continue
@@ -272,6 +279,29 @@ class ClusterSync:
         self.deleted_vm_ids = set()   # VMs deleted (or, in dry run, to be deleted) this run
         self.carry = {}               # lower(new name) -> {'zabbix_hostid', 'tags', 'ips', 'primary4', 'primary6', 'from'}
         self.carry_map = {}           # lower(old hand-made name) -> lower(Proxmox name), from --carry-map
+        self._vrf_cache = {}          # (network, vlan tag) -> NetBox VRF or None
+
+    def vrf_for(self, addr, tag):
+        '''VRF for a guest IP: the one prefix containing it that is in a VRF and carries the NIC's VLAN.
+
+        Lets overlapping customer LANs (e.g. every hosted firewall on 172.18.255.0/24) live in their own VRF;
+        anything without such a prefix stays in the global table.'''
+        if not tag:
+            return None
+        net = str(ipaddress.ip_interface(addr).network)
+        key = (net, str(tag))
+        if key not in self._vrf_cache:
+            found = {p.vrf.id: p.vrf for p in self.nb.ipam.prefixes.filter(contains=str(ipaddress.ip_interface(addr).ip))
+                     if p.vrf and p.vlan and str(p.vlan.vid) == str(tag)}
+            if len(found) > 1:
+                self.plan.note('warn', f"{addr} on VLAN {tag}: prefixes in {len(found)} VRFs "
+                                       f"({', '.join(v.name for v in found.values())}) match; using global")
+            self._vrf_cache[key] = next(iter(found.values())) if len(found) == 1 else None
+        return self._vrf_cache[key]
+
+    def _ip_label(self, addr, tag):
+        vrf = self.vrf_for(addr, tag)
+        return f'{addr} (VRF {vrf.name})' if vrf else addr
 
     # -- helpers that treat things on to-be-deleted VMs as free (accurate dry runs)
     def _on_deleted_vm(self, obj) -> bool:
@@ -643,7 +673,8 @@ class ClusterSync:
             iface = by_mac.get(nic['mac']) or by_name.get(nic['name'])
             if iface is None:
                 self.plan.note('create', f"{label}: interface {nic['name']} {nic['mac']} ({desc})"
-                                         + (f" IPs {', '.join(nic['ips'])}" if nic['ips'] else ''))
+                                         + (f" IPs {', '.join(self._ip_label(a, nic['tag']) for a in nic['ips'])}"
+                                            if nic['ips'] else ''))
                 if nb_vm is not None and not self.plan.dry_run:
                     iface = self.nb.virtualization.interfaces.create(virtual_machine=nb_vm.id, name=nic['name'],
                                                                      description=desc)
@@ -699,23 +730,26 @@ class ClusterSync:
             if addr in current:
                 current.pop(addr)
                 continue
-            same = [ip for ip in self.nb.ipam.ip_addresses.filter(address=addr) if not self._on_deleted_vm(ip)]
+            vrf = self.vrf_for(addr, nic['tag'])
+            shown = self._ip_label(addr, nic['tag'])
+            same = [ip for ip in self.nb.ipam.ip_addresses.filter(address=addr, vrf_id=vrf.id if vrf else 'null')
+                    if not self._on_deleted_vm(ip)]
             assigned = [ip for ip in same if ip.assigned_object_id]
             if assigned:
-                self.plan.note('warn', f'{label}: {addr} already exists in NetBox on {assigned[0].assigned_object}; '
+                self.plan.note('warn', f'{label}: {shown} already exists in NetBox on {assigned[0].assigned_object}; '
                                        f'not reassigned')
                 continue
             if len(same) > 1:
-                self.plan.note('warn', f'{label}: {addr} exists {len(same)} times (unassigned) in NetBox; not assigned')
+                self.plan.note('warn', f'{label}: {shown} exists {len(same)} times (unassigned) in NetBox; not assigned')
                 continue
             if iface is None:   # new interface in a dry run: already listed with the create
                 continue
-            self.plan.note('create', f"{label}: IP {addr} on {nic['name']}")
+            self.plan.note('create', f"{label}: IP {shown} on {nic['name']}")
             if not self.plan.dry_run:
                 if same:
                     same[0].update({'assigned_object_type': 'virtualization.vminterface', 'assigned_object_id': iface.id})
                 else:
-                    self.nb.ipam.ip_addresses.create(address=addr, status='active',
+                    self.nb.ipam.ip_addresses.create(address=addr, status='active', vrf=vrf.id if vrf else None,
                                                      assigned_object_type='virtualization.vminterface',
                                                      assigned_object_id=iface.id)
         for addr, ip in current.items():

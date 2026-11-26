@@ -349,6 +349,13 @@ warning; the rest of the sync still runs.
 - Interfaces, disks and IPs on synced VMs that Proxmox/the guest no longer
   reports are removed. A MAC or IP already assigned to some other NetBox object
   is never taken over; it's reported as a warning.
+- **Guest IPs go into a VRF when NetBox says so**: if a prefix that contains the
+  IP is in a VRF *and* has the NIC's Proxmox VLAN tag as its VLAN, the IP is
+  created in (and matched against) that VRF; otherwise it stays in the global
+  table. This lets hosted customer firewalls that all use the same LAN (e.g.
+  `172.18.255.0/24`) each live in their own VRF: create the VRF, then the
+  prefix in it with the customer's VLAN. Two VRFs matching is a warning and the
+  IP stays global.
 - Primary IPv4 prefers a private (RFC 1918) address, so LAN monitoring reaches
   it. Platform is only set when blank (from the guest OS).
 - Stopped guests become **Offline** (netbox-zabbix-sync disables, not deletes,
