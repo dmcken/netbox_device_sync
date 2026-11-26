@@ -389,13 +389,36 @@ class ClusterSync:
                 inv['ipmi ' + k.strip().lower()] = v.strip()
         return inv, None
 
+    @staticmethod
+    def inventory_targets(dev, ip):
+        '''SSH targets for a node: its Proxmox cluster IP, then its NetBox primary IP(s).
+
+        The cluster IP is often on a corosync-only network the sync host cannot
+        reach, while the primary IP is the management address used for the API.'''
+        out = [ip] if ip else []
+        for attr in ('primary_ip4', 'primary_ip6'):
+            obj = getattr(dev, attr, None) if dev is not None else None
+            if obj:
+                addr = str(ipaddress.ip_interface(str(obj.address)).ip)
+                if addr not in out:
+                    out.append(addr)
+        return out
+
     def sync_hardware(self, node, dev, ip):
-        if not ip or not os.path.exists(SSH_KEY):
+        targets = self.inventory_targets(dev, ip)
+        if not targets or not os.path.exists(SSH_KEY):
             return
         label = f'node {node}'
-        inv, err = self.read_inventory(ip)
+        inv, errs = None, []
+        for target in targets:
+            inv, err = self.read_inventory(target)
+            if inv is not None:
+                if target != ip:
+                    logger.debug(f'[{self.cluster.name}] {label}: inventory read via primary IP {target}')
+                break
+            errs.append(f'{target}: {err}')
         if inv is None:
-            self.plan.note('warn', f'{label}: hardware inventory unavailable over SSH ({err}); '
+            self.plan.note('warn', f'{label}: hardware inventory unavailable over SSH ({"; ".join(errs)}); '
                                    f'see README "Hardware inventory"')
             return
         if dev is None:       # created in a dry run

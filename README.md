@@ -287,7 +287,10 @@ VMs without the guest agent installed/enabled never get IPs.
 
 The Proxmox API has no DMI data, so for each node the sync also runs a fixed,
 read-only command over SSH: `dmidecode` (manufacturer, model, service tag, BIOS)
-and `ipmitool lan print 1` (BMC IP, mask, MAC). From that it sets:
+and `ipmitool lan print 1` (BMC IP, mask, MAC). It connects to the node's
+Proxmox cluster IP first and, if that fails (for example a corosync-only
+network the sync host cannot route to), to the node device's NetBox primary
+IP. From that it sets:
 
 - the device **serial** (Dell service tag);
 - the **device type**, but only on nodes the sync created (description starts
